@@ -1,0 +1,20 @@
+# Fly.io config for the Firmity backend.
+#   Edit `app` after `fly launch` picks a name, or run `fly launch --no-deploy` to generate.
+# The key line for "no cold start": auto_stop_machines = "off" + min_machines_running = 1.
+
+app = "firmity-backend"
+primary_region = "bom"   # Mumbai (closest to India). Change if you prefer.
+
+[build]
+  dockerfile = "Dockerfile"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = "off"     # <- keep it running (no cold start)
+  auto_start_machines = true
+  min_machines_running = 1       # <- always at least one live machine
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "512mb"               # matplotlib + fpdf render comfortably in 512MB

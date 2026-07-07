@@ -1,0 +1,7 @@
+# Report rendering — pure-Python, installs cleanly on Windows (no GTK/system deps).
+#   pip install -r requirements-report.txt
+fpdf2==2.8.4
+python-docx==1.1.2
+Pillow==11.0.0      # image embedding in PDFs (fpdf2 image support)
+httpx==0.27.2       # download survey photos from Storage for embedding
+matplotlib==3.9.2   # charts (gauge, bars, donut, heatmap) rendered to PNG

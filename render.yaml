@@ -1,0 +1,27 @@
+# Render Blueprint for the FastAPI backend (Docker).
+# In Render: New > Blueprint > pick your repo. It reads this file and creates the service.
+# Set the four `sync: false` secrets when prompted.
+services:
+  - type: web
+    name: firmity-backend
+    runtime: docker
+    rootDir: backend            # the backend lives in a subfolder of the repo
+    dockerfilePath: ./Dockerfile
+    plan: starter               # 'free' = spins down after 15 min idle (cold start ~30-60s).
+                                # 'starter' (~$7/mo) stays warm = NO cold start. Recommended.
+    region: singapore           # closest to India; also: oregon, frankfurt, ohio, virginia
+    healthCheckPath: /health
+    autoDeploy: true            # redeploy on every git push
+    envVars:
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: CORS_ORIGINS
+        sync: false             # e.g. https://your-live-site.com
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash

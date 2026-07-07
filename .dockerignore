@@ -1,0 +1,35 @@
+# Keep the image lean — only app code + requirements + bundled fonts get in.
+# (Fonts under app/assets/fonts are NOT ignored — they're required for the PDF.)
+
+# Python caches / builds
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Secrets / local (set env in Render's dashboard, never bake into the image)
+.env
+.env.*
+*.log
+
+# Docs & tests — not needed at runtime
+*.md
+tests/
+
+# VCS / OS / editors
+.git/
+.gitignore
+.dockerignore
+.DS_Store
+.vscode/
+.idea/
+
+# Local scratch
+data/
