@@ -17,6 +17,7 @@ AnswerType = Literal["choice", "text", "number", "yes_no", "rating", "remarks", 
 SELECTABLE_DOMAINS: frozenset[str] = frozenset({
     "security", "fire_safety", "hvac", "electrical", "plumbing",
     "civil", "horticulture", "housekeeping", "green_building",
+    "technology",
 })
 
 

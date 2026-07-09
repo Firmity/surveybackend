@@ -78,6 +78,25 @@ _SECTION_STYLES: dict = {}  # section key -> {"accent","bg","text"} hex override
 SPACING = 1.0               # vertical spacing multiplier for responses
 _TOC_ENTRIES: list = []     # (name, level, page_no) collected during the first render pass
 
+# Template content toggles (from ContentConfig): which graphs/sections appear.
+_GRAPHS_ON: dict = {}       # graph key -> bool
+_SECTIONS_ON: dict = {}     # section key -> bool
+
+
+def _graph_on(key: str) -> bool:
+    """A graph is shown unless the template explicitly turns it off."""
+    return bool(_GRAPHS_ON.get(key, True))
+
+
+def _section_on(key: str) -> bool:
+    """A section is shown unless the template explicitly turns it off."""
+    return bool(_SECTIONS_ON.get(key, True))
+
+
+# Full-page divider background. Deep brand blue rather than pure black (black reads as
+# heavy / unfriendly); still high-contrast for the white title + lime eyebrow on top.
+DIVIDER_BG = (30, 58, 138)  # #1e3a8a
+
 
 def _ss_col(key: str, field: str, default_rgb: tuple) -> tuple:
     """Resolve a per-section colour override (accent/bg/text) or fall back to default."""
@@ -144,6 +163,19 @@ def apply_template(cfg: Optional[dict]) -> None:
             keep = {k: v for k, v in sval.items() if v and k in ("accent", "bg", "text")}
             if keep:
                 _SECTION_STYLES[skey] = keep
+
+    # Content toggles: which graphs / sections appear (default: everything on).
+    _GRAPHS_ON.clear()
+    _SECTIONS_ON.clear()
+    cont = cfg.get("content") or {}
+    if isinstance(cont, dict):
+        gr = cont.get("graphs")
+        if isinstance(gr, dict):
+            _GRAPHS_ON.update({k: bool(v) for k, v in gr.items()})
+        so = cont.get("sections_on")
+        if isinstance(so, dict):
+            _SECTIONS_ON.update({k: bool(v) for k, v in so.items()})
+
     try:
         SPACING = min(2.0, max(0.6, float(cfg.get("spacing") or 1.0)))
     except (TypeError, ValueError):
@@ -260,7 +292,11 @@ def _deploy_rows(plan: dict) -> list[tuple[str, list[tuple[str, str]]]]:
         for role, cell in rows.items():
             if not isinstance(cell, dict):
                 continue
-            nums = {k: v for k, v in cell.items() if k != "remark" and isinstance(v, (int, float)) and v}
+            if cell.get("na"):
+                continue  # role/location marked not applicable at this facility
+            nums = {k: v for k, v in cell.items()
+                    if k not in ("remark", "na") and isinstance(v, (int, float))
+                    and not isinstance(v, bool) and v}
             total = sum(nums.values())
             remark = cell.get("remark") or ""
             if total == 0 and not remark:
@@ -480,7 +516,7 @@ def _subhead(pdf, title, desc="", accent=BLUE, rule=True):
         pdf.ln(1)
 
 
-def _section_divider(pdf, eyebrow, title, description, accent=LIME, bg=INK, key=None, text=WHITE):
+def _section_divider(pdf, eyebrow, title, description, accent=LIME, bg=DIVIDER_BG, key=None, text=WHITE):
     pdf.chrome = False
     pdf.add_page()
     pdf.set_auto_page_break(False)
@@ -576,8 +612,15 @@ def _rating_counts(groups):
 FACILITY_FIRST = ["Site Profile"]
 FACILITY_LAST = ["Staff Profile", "Client Pain Areas", "UREST Suggestion"]
 
+# Areas whose answers are client / UREST input rather than a physical zone. They
+# are NOT rendered as their own report section — their content is synthesised by
+# the AI into "URest Recommendations" instead, so it is not shown twice. (UREST
+# suggestions used to appear both here AND in the recommendations at the end.)
+_HIDE_AREAS = {"urest suggestion"}
+
 
 def _ordered_areas(areas):
+    areas = [a for a in areas if str(a).strip().lower() not in _HIDE_AREAS]
     first = [a for a in FACILITY_FIRST if a in areas]
     last = [a for a in FACILITY_LAST if a in areas]
     mids = sorted(a for a in areas if a not in first and a not in last)
@@ -608,28 +651,14 @@ def _cover(pdf, survey, content, health, photos):
     pdf.set_text_color(*MUTED)
     pdf.cell(0, 8, survey.get("facility_name") or "Facility")
 
-    # tile mosaic (photos + blue/lime/ink blocks)
-    imgs = [it["data"] for lst in photos.values() for it in lst if it.get("data")][:4]
-    tiles = []
-    blocks = [BLUE, LIME, INK, BLUE, LIME]
-    bi = 0
-    for i in range(7):
-        if imgs:
-            tiles.append(("img", imgs.pop(0)))
-        else:
-            tiles.append(("block", blocks[bi % len(blocks)]))
-            bi += 1
+    # Branded block band. Survey photos are intentionally NOT placed on the cover:
+    # arbitrary uploaded images (logos, diagrams) get stretched into the narrow tiles
+    # and look distorted, so the cover uses clean brand-colour blocks only.
+    blocks = [BLUE, LIME, BLUE, LIME, INK, BLUE, LIME]
     ty, th, gap = 120, 72, 5
     tw = (CW - gap * 6) / 7
-    for i, (kind, val) in enumerate(tiles):
-        x = M + i * (tw + gap)
-        if kind == "img":
-            try:
-                pdf.image(io.BytesIO(val), x=x, y=ty, w=tw, h=th)
-            except Exception:
-                _rrect(pdf, x, y=ty, w=tw, h=th, rgb=BLUE, r=5)
-        else:
-            _rrect(pdf, x, ty, tw, th, val, r=5)
+    for i, col in enumerate(blocks):
+        _rrect(pdf, M + i * (tw + gap), ty, tw, th, col, r=5)
 
     pdf.set_xy(M, 200)
     pdf.set_font(F, "", 9)
@@ -685,7 +714,7 @@ def _overview(pdf, survey, content, health, actions, groups):
     pdf.set_y(max(gy + 70, cy + 32))
     # category bars
     rows = [(_dl(d["domain"]), d["score"], d.get("graded", 0)) for d in (health or {}).get("domains", [])]
-    if rows:
+    if rows and _graph_on("domain_bars"):
         _h1(pdf, "Health score by category")
         pdf.set_x(M)
         _txt(pdf, CW, 5, "Each category scored 0-100 from the surveyor's ratings. Longer green bars are "
@@ -714,7 +743,7 @@ def _exec_summary(pdf, content, groups):
     pdf.set_font(F, "B", 8)
     pdf.set_text_color(*MUTED)
     pdf.cell(0, 4, "RATING DISTRIBUTION")
-    if dimg:
+    if dimg and _graph_on("donut"):
         try:
             pdf.image(io.BytesIO(dimg), x=M + 11, y=card_y + 11, w=73)
         except Exception:
@@ -734,7 +763,7 @@ def _building_divider(pdf, index, name, score, ss_key="building"):
     pdf.add_page()
     pdf.set_auto_page_break(False)
     _toc_mark(pdf, name, level=1)
-    _rrect(pdf, -2, -2, PAGE_W + 4, PAGE_H + 4, _ss_col(ss_key, "bg", INK), r=0)
+    _rrect(pdf, -2, -2, PAGE_W + 4, PAGE_H + 4, _ss_col(ss_key, "bg", DIVIDER_BG), r=0)
     pdf.set_xy(M, 40)
     pdf.set_font(F, "B", 12)
     pdf.set_text_color(*_ss_col(ss_key, "accent", LIME))
@@ -763,6 +792,7 @@ _ICON_FOR = {
     "general": "info", "security": "shield", "fire_safety": "flame", "hvac": "fan",
     "electrical": "bolt", "plumbing": "drop", "civil": "building", "horticulture": "leaf",
     "housekeeping": "spark", "green_building": "leaf", "green_building_key": "leaf",
+    "technology": "bolt",
     "sop_registers": "doc", "inventory": "box", "maintenance_manager": "wrench",
     "general_maintenance": "wrench", "technical_key": "wrench",
     "client_pain_areas": "info", "urest_suggestion": "info",
@@ -886,6 +916,8 @@ def _category_block(pdf, area, domain, answers, sec, photos_for):
     _need(pdf, 42)
     score = _group_score(answers)
     facts = [a for a in answers if grade_value(a.get("value")) is None and (a.get("value") or a.get("remark"))]
+    value_facts = [a for a in facts if a.get("value") not in (None, "")]
+    note_facts = [a for a in facts if a.get("value") in (None, "") and a.get("remark")]  # remarks-only (e.g. UREST)
     graded_ans = [a for a in answers if grade_value(a.get("value")) is not None]
     g, s, p = _status_counts(answers)
     acc = _sc_rgb(score) if score is not None else BLUE
@@ -912,10 +944,15 @@ def _category_block(pdf, area, domain, answers, sec, photos_for):
         _tag(pdf, M + CW - 30, y + (band_h - 6) / 2, f"{score}/100", acc, size=9, h=6)
     pdf.set_y(y + band_h + _sp(4))
 
-    if facts:
+    if value_facts:
         _caption(pdf, "Key facts")
-        _fact_tiles(pdf, facts)
+        _fact_tiles(pdf, value_facts)
         pdf.ln(_sp(2))
+    if note_facts:
+        _caption(pdf, "Observations & notes")
+        for a in note_facts:
+            _note_line(pdf, a.get("question", ""), a.get("remark", ""))
+        pdf.ln(_sp(1))
 
     if graded_ans:
         _caption(pdf, "Status summary")
@@ -941,31 +978,70 @@ def _category_block(pdf, area, domain, answers, sec, photos_for):
             _txt(pdf, CW, 4.6, f"+ {g} item(s) rated Good — no action required.", size=8.5, style="I", rgb=MUTED)
 
     if sec:
-        _findings(pdf, "Risks", sec.risks, RED)
-        _findings(pdf, "Recommendations", sec.recommendations, BLUE)
+        _findings(pdf, "Risks", sec.risks, RED, _tint(RED))
+        _findings(pdf, "Recommendations", sec.recommendations, BLUE, _tint(BLUE))
     _photos_grid(pdf, photos_for)
     pdf.ln(_sp(4))
     _rule(pdf)
 
 
-def _findings(pdf, title, items, accent):
+def _tint(rgb, f=0.88):
+    """Blend a colour toward white for a soft background tint."""
+    return tuple(int(c + (255 - c) * f) for c in rgb)
+
+
+def _wrapped_lines(pdf, text, w):
+    """How many lines `text` wraps to at width w (for sizing a background panel)."""
+    try:
+        return max(1, len(pdf.multi_cell(w, 5, str(text), split_only=True)))
+    except Exception:  # noqa: BLE001 - measuring fallback
+        return max(1, int(pdf.get_string_width(str(text)) / max(1.0, w)) + 1)
+
+
+def _note_line(pdf, question, remark):
+    """Render a remarks-only answer (e.g. UREST suggestions) that has no rating value.
+    Fixes the PDF showing blank where the Word doc showed the note."""
+    if question:
+        _need(pdf, 6)
+        pdf.set_x(M)
+        pdf.set_font(F, "B", 9)
+        pdf.set_text_color(*INK)
+        pdf.multi_cell(CW, 4.6, str(question), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    if remark:
+        _need(pdf, 6)
+        pdf.set_x(M)
+        pdf.set_font(F, "", 9)
+        pdf.set_text_color(*MUTED)
+        pdf.multi_cell(CW, 4.6, str(remark), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(1.5)
+
+
+def _findings(pdf, title, items, accent, tint=None):
+    """Risks / Recommendations on a soft tinted panel with an accent stripe — these are
+    the report's headline value, so they get their own highlighted block."""
     if not items:
         return
-    _need(pdf, 9)
-    pdf.set_x(M)
+    tint = tint if tint is not None else _tint(accent)
+    line_h, inner_w, pad = 5.0, CW - 14, 3.0
+    n_lines = sum(_wrapped_lines(pdf, it, inner_w) for it in items)
+    block_h = 8 + n_lines * line_h + pad * 2
+    _need(pdf, block_h + 3)
+    y0 = pdf.get_y()
+    _rrect(pdf, M, y0, CW, block_h, tint, r=3)
+    _rrect(pdf, M, y0 + 1.5, 2.4, block_h - 3, accent, r=1)  # accent stripe
+    pdf.set_xy(M + 8, y0 + pad)
     pdf.set_font(F, "B", 9.5)
     pdf.set_text_color(*accent)
     pdf.cell(0, 5.5, title, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
     pdf.set_font(F, "", 9)
     pdf.set_text_color(*INK)
     for it in items:
-        _need(pdf, 6)
         yy = pdf.get_y()
         pdf.set_fill_color(*accent)
-        pdf.rect(M + 1, yy + 1.7, 1.6, 1.6, style="F")
-        pdf.set_xy(M + 5, yy)
-        pdf.multi_cell(CW - 6, 5, it, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-    pdf.ln(1)
+        pdf.rect(M + 8, yy + 1.7, 1.6, 1.6, style="F")
+        pdf.set_xy(M + 12, yy)
+        pdf.multi_cell(inner_w, line_h, str(it), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.set_y(y0 + block_h + 2)
 
 
 def _photos_grid(pdf, items):
@@ -1030,6 +1106,48 @@ def _gantt_rows(actions):
     return [(r[0], r[1], r[2], r[3]) for r in rows]
 
 
+# Distinct colours assigned to areas so the corrective plan can be scanned by area
+# (e.g. every "Auditorium" item shares one colour stripe + chip).
+_AREA_COLORS = [
+    (47, 92, 255), (22, 163, 74), (245, 158, 11), (124, 58, 237),
+    (13, 148, 136), (219, 39, 119), (2, 132, 199), (101, 163, 13),
+]
+
+
+def _area_color(area, order):
+    try:
+        idx = order.index(area)
+    except ValueError:
+        idx = 0
+    return _AREA_COLORS[idx % len(_AREA_COLORS)]
+
+
+def _area_legend(pdf, actions, area_order):
+    """Compact legend: each area's colour + high/total action counts, so the reader
+    can see at a glance e.g. 'Auditorium (blue) — 3 high / 5'."""
+    if not area_order:
+        return
+    _need(pdf, 12)
+    y = pdf.get_y()
+    x = M
+    pdf.set_font(F, "", 8.5)
+    for area in area_order:
+        acol = _area_color(area, area_order)
+        n_high = sum(1 for a in actions if str(a.get("area") or "—") == area and a.get("severity") == "high")
+        n_all = sum(1 for a in actions if str(a.get("area") or "—") == area)
+        label = f"{area[:18]}  ·  {n_high} high / {n_all}"
+        w = pdf.get_string_width(label) + 9
+        if x + w > PAGE_W - M:
+            x = M
+            y += 7
+        _rrect(pdf, x, y + 0.4, 3.5, 3.5, acol, r=1)
+        pdf.set_xy(x + 5, y - 0.4)
+        pdf.set_text_color(*INK)
+        pdf.cell(w - 5, 5, label)
+        x += w + 4
+    pdf.set_y(y + 9)
+
+
 def _corrective(pdf, actions):
     if not actions:
         return
@@ -1065,47 +1183,77 @@ def _corrective(pdf, actions):
                        "Blue dashed line = recommended re-inspection.", size=8.5, style="I", rgb=MUTED)
     pdf.ln(2)
 
-    # ---- Action detail ----
+    # ---- Action detail (highlighted + colour-coded by area) ----
     _subhead(pdf, "Action detail",
-             "Every corrective action with its finding and recommended fix, highest priority first.", accent=INK)
+             "Every corrective action with its finding and recommended fix, highest priority first. "
+             "The colour stripe + chip group items by area, so you can see at a glance how many "
+             "priority items each area carries.", accent=INK)
+    # areas in first-seen order -> stable colour assignment
+    area_order: list[str] = []
+    for ac in actions:
+        ar = str(ac.get("area", "") or "—")
+        if ar not in area_order:
+            area_order.append(ar)
+    _area_legend(pdf, actions, area_order)
     for i, ac in enumerate(actions, 1):
-        _need(pdf, 15)
-        yy = pdf.get_y()
         sev = ac.get("severity", "medium")
-        _tag(pdf, M, yy, sev.upper(), RED if sev == "high" else AMBER, size=8, h=5.4, w=24)
-        pdf.set_xy(M + 28, yy - 0.4)
+        area = str(ac.get("area", "") or "—")
+        acol = _area_color(area, area_order)
+        finding = f"Finding: {ac.get('finding')} — {ac.get('question')}"
+        action = f"Action: {ac.get('action')}"
+        fh = _wrapped_lines(pdf, finding, CW - 16) * 4.8
+        ah = _wrapped_lines(pdf, action, CW - 16) * 4.8
+        card_h = 11 + fh + ah + 4
+        _need(pdf, card_h + 2)
+        y0 = pdf.get_y()
+        _rrect(pdf, M, y0, CW, card_h, _tint(acol, 0.90), r=3)       # light area tint = highlight
+        _rrect(pdf, M, y0 + 1.5, 2.6, card_h - 3, acol, r=1)          # area colour stripe
+        _tag(pdf, M + 6, y0 + 3, sev.upper(), RED if sev == "high" else AMBER, size=8, h=5.4, w=22)
+        pdf.set_xy(M + 32, y0 + 3.4)
         pdf.set_font(F, "B", 10)
         pdf.set_text_color(*INK)
-        pdf.multi_cell(CW - 28, 5.4, f"{i}.  {_dl(ac.get('domain',''))}  ·  {ac.get('area','')}",
-                       new_x=XPos.LMARGIN, new_y=YPos.NEXT)
-        pdf.set_x(M + 28)
-        _txt(pdf, CW - 28, 4.8, f"Finding: {ac.get('finding')} — {ac.get('question')}", size=9, rgb=INK)
-        pdf.set_x(M + 28)
-        _txt(pdf, CW - 28, 4.8, f"Action: {ac.get('action')}", size=9, style="I", rgb=MUTED)
-        pdf.ln(2.5)
+        pdf.cell(CW - 92, 5.2, f"{i}.  {_dl(ac.get('domain', ''))}")
+        _tag(pdf, M + CW - 50, y0 + 3, area[:20], acol, size=8, h=5.4, w=46)   # area chip in its colour
+        pdf.set_xy(M + 8, y0 + 11)
+        pdf.set_font(F, "B", 9)
+        pdf.set_text_color(*INK)
+        pdf.multi_cell(CW - 16, 4.8, finding, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_x(M + 8)
+        pdf.set_font(F, "", 9)
+        pdf.set_text_color(*MUTED)
+        pdf.multi_cell(CW - 16, 4.8, action, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_y(y0 + card_h + 2)
 
 
 def _key_recs(pdf, content):
     if not content.key_recommendations:
         return
-    _content_page(pdf, "Key Recommendations")
-    _h1(pdf, "Key Recommendations", accent=LIME_G)
+    _content_page(pdf, "URest Recommendations")
+    _h1(pdf, "URest Recommendations", accent=LIME_G)
     pdf.set_x(M)
     _txt(pdf, CW, 5, "The highest-impact actions to raise this facility's health score, in priority order. "
                      "Addressing these first will resolve the most critical risks found during the survey.",
          size=9.5, rgb=MUTED)
-    pdf.ln(2)
+    pdf.ln(3)
+    tint = _tint(LIME_G, 0.86)
     for i, rec in enumerate(content.key_recommendations, 1):
-        _need(pdf, 12)
-        yy = pdf.get_y()
-        _rrect(pdf, M, yy, 9, 9, BLUE, r=4.5)
-        pdf.set_xy(M, yy)
+        rh = _wrapped_lines(pdf, rec, CW - 26) * 5.6
+        card_h = max(15, rh + 8)
+        _need(pdf, card_h + 2)
+        y0 = pdf.get_y()
+        _rrect(pdf, M, y0, CW, card_h, tint, r=3)                 # highlighted panel
+        _rrect(pdf, M, y0 + 1.5, 2.6, card_h - 3, LIME_G, r=1)    # accent stripe
+        by = y0 + (card_h - 9) / 2
+        _rrect(pdf, M + 6, by, 9, 9, BLUE, r=4.5)
+        pdf.set_xy(M + 6, by)
         pdf.set_font(F, "B", 11)
         pdf.set_text_color(*WHITE)
         pdf.cell(9, 9, str(i), align="C")
-        pdf.set_xy(M + 13, yy)
-        _txt(pdf, CW - 15, 5.6, rec, size=11, rgb=INK)
-        pdf.ln(2)
+        pdf.set_xy(M + 20, y0 + (card_h - rh) / 2)
+        pdf.set_font(F, "", 11)
+        pdf.set_text_color(*INK)
+        pdf.multi_cell(CW - 26, 5.6, rec, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_y(y0 + card_h + 2)
 
 
 def _back_cover(pdf, survey):
@@ -1203,15 +1351,16 @@ def _render_pdf_body(content, survey, photos, view, health, actions, groups, toc
     if toc:  # pass 2 only: real contents page right after the cover
         _contents_page(pdf, toc)
     _overview(pdf, survey, content, health, actions, groups)
-    _exec_summary(pdf, content, groups)
+    if _section_on("exec_summary"):
+        _exec_summary(pdf, content, groups)
 
     areas = _ordered_areas({a for (a, _d) in grp.keys()})
-    if areas:
+    if areas and _section_on("buildings"):
         _section_divider(pdf, *SECTIONS["buildings"], accent=_ss_col("buildings", "accent", LIME),
-                         bg=_ss_col("buildings", "bg", INK), key="buildings",
+                         bg=_ss_col("buildings", "bg", DIVIDER_BG), key="buildings",
                          text=_ss_col("buildings", "text", WHITE))
     idx = 0
-    for area in areas:
+    for area in (areas if _section_on("buildings") else ()):
         doms = [d for (a, d) in grp.keys() if a == area]
         if area != "Site Profile":
             doms = [d for d in doms if d != "general"]
@@ -1232,19 +1381,21 @@ def _render_pdf_body(content, survey, photos, view, health, actions, groups, toc
             _building_scorecard(pdf, bscore, bg_g, bg_s, bg_p)
         for d in doms:
             _category_block(pdf, area, d, grp.get((area, d), []), secidx.get((area, d)),
-                            photos.get(_pk(area, d), []))
+                            photos.get(_pk(area, d), []) if _section_on("photos") else [])
 
-    if actions:
+    if actions and _section_on("corrective"):
         _section_divider(pdf, *SECTIONS["corrective"], accent=_ss_col("corrective", "accent", LIME),
-                         bg=_ss_col("corrective", "bg", INK), key="corrective",
+                         bg=_ss_col("corrective", "bg", DIVIDER_BG), key="corrective",
                          text=_ss_col("corrective", "text", WHITE))
-    _corrective(pdf, actions)
+    if _section_on("corrective"):
+        _corrective(pdf, actions)
 
-    if content.key_recommendations:
+    if content.key_recommendations and _section_on("key_recs"):
         _section_divider(pdf, *SECTIONS["key_recs"], accent=_ss_col("key_recs", "accent", LIME),
-                         bg=_ss_col("key_recs", "bg", BLUE), key="key_recs",
+                         bg=_ss_col("key_recs", "bg", DIVIDER_BG), key="key_recs",
                          text=_ss_col("key_recs", "text", WHITE))
-    _key_recs(pdf, content)
+    if _section_on("key_recs"):
+        _key_recs(pdf, content)
     _back_cover(pdf, survey)
     return bytes(pdf.output())
 
@@ -1334,7 +1485,7 @@ def _caption_p(doc, text) -> None:
     _para(doc, str(text).upper(), bold=True, color=MUTED, size=8.5, space_before=2, space_after=2)
 
 
-def _divider(doc, eyebrow, title, description, *, key=None, accent=BLUE, bg_default=INK) -> None:
+def _divider(doc, eyebrow, title, description, *, key=None, accent=BLUE, bg_default=DIVIDER_BG) -> None:
     """Section intro: a full-width colour banner (mirrors the PDF's divider pages),
     themed per-section via section_styles when `key` is given."""
     doc.add_page_break()
@@ -1443,8 +1594,9 @@ def _docx_cover(doc, survey, content) -> None:
 def _docx_exec(doc, content, groups) -> None:
     _heading(doc, "Executive Summary", size=20, color=INK, accent=BLUE)
     counts = _rating_counts(groups)
-    _pic(doc, charts.rating_donut(counts["good"], counts["satis"], counts["poor"], counts["na"]), 3.0)
-    _caption_p(doc, "Rating distribution")
+    if _graph_on("donut"):
+        _pic(doc, charts.rating_donut(counts["good"], counts["satis"], counts["poor"], counts["na"]), 3.0)
+        _caption_p(doc, "Rating distribution")
     _para(doc, content.executive_summary, color=INK, size=10.5, space_after=6)
     grade = content.overall_rating
     t = doc.add_table(rows=1, cols=1)
@@ -1461,7 +1613,7 @@ def _docx_health(doc, health, content) -> None:
     _pic(doc, charts.gauge(score, grade), 2.4)
     _caption_p(doc, "Overall health score")
     rows = [(_dl(d["domain"]), d["score"], d.get("graded", 0)) for d in (health or {}).get("domains", [])]
-    if rows:
+    if rows and _graph_on("domain_bars"):
         _para(doc, "Each category scored 0-100 from the surveyor's ratings. Longer green bars are "
                    "healthier; short red bars need attention.", color=MUTED, size=9.5)
         _pic(doc, charts.category_bars(rows), 6.4)
@@ -1655,10 +1807,11 @@ def _render_docx_body(content, survey, photos, view, health, actions, groups) ->
         toc_names.append(SECTIONS["key_recs"][1])
     _docx_contents(doc, toc_names)
 
-    _docx_exec(doc, content, groups)
+    if _section_on("exec_summary"):
+        _docx_exec(doc, content, groups)
     _docx_health(doc, health, content)
 
-    if areas:
+    if areas and _section_on("buildings"):
         # ---- rich per-building path (uses raw answers + AI findings) ----
         _divider(doc, *SECTIONS["buildings"], key="buildings")
         idx = 0
@@ -1685,14 +1838,14 @@ def _render_docx_body(content, survey, photos, view, health, actions, groups) ->
                 _docx_scorecard(doc, bscore, bg_g, bg_s, bg_p)
             for d in doms:
                 _docx_category(doc, area, d, grp.get((area, d), []), secidx.get((area, d)),
-                               photos.get(_pk(area, d), []))
-    else:
+                               photos.get(_pk(area, d), []) if _section_on("photos") else [])
+    elif _section_on("buildings"):
         # ---- fallback: no per-area answers -> AI narrative sections ----
         _divider(doc, *SECTIONS["buildings"], key="buildings")
         _docx_body(doc, content.sections, photos, "area" if view == "area" else "domain",
-                   with_photos=True)
+                   with_photos=_section_on("photos"))
 
-    if actions:
+    if actions and _section_on("corrective"):
         _divider(doc, *SECTIONS["corrective"], key="corrective")
         _docx_corrective(doc, actions)
 
@@ -1707,7 +1860,7 @@ def _render_docx_body(content, survey, photos, view, health, actions, groups) ->
                 _cell(t.cell(i, 0), role, bold=True, color=INK, size=9.5, fill=CREAM)
                 _cell(t.cell(i, 1), txt, color=INK, size=9.5, fill=CREAM)
 
-    if content.key_recommendations:
+    if content.key_recommendations and _section_on("key_recs"):
         _divider(doc, *SECTIONS["key_recs"], accent=LIME_G)
         _docx_key_recs(doc, content)
 

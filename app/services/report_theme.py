@@ -46,6 +46,7 @@ CATEGORY_LABELS = {
     "horticulture": "Horticulture / Landscaping",
     "housekeeping": "Housekeeping & Sanitation",
     "green_building": "Green Building Survey",
+    "technology": "Technology Readiness",
     "maintenance_manager": "Maintenance Manager",
     "technical_key": "Technical Key",
     "general_maintenance": "General Maintenance",

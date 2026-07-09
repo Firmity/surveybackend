@@ -15,6 +15,7 @@ from google.genai import types
 from pydantic import BaseModel, Field
 
 from ..config import get_settings
+from .report_template import ContentConfig, build_system_prompt
 
 log = logging.getLogger("gemini")
 
@@ -47,18 +48,24 @@ _SYSTEM = (
 
 
 async def generate_report_content(
-    survey: dict[str, Any], groups: list[dict], health: dict | None = None
+    survey: dict[str, Any],
+    groups: list[dict],
+    health: dict | None = None,
+    content: ContentConfig | None = None,
 ) -> ReportContent:
     """
     groups: [{ "area": str, "domain": str, "answers": [{question,value,remark}] }, ...]
     health: optional {overall, grade, domains} so the AI's rating aligns with the
             deterministic score.
+    content: the selected report template's ContentConfig (focus/tone/length/audience or
+             a free-form prompt). None -> the Default report prompt (unchanged output).
     Raises RuntimeError on unusable output.
     """
     s = get_settings()
     if not s.gemini_api_key:
         raise RuntimeError("[CONFIG_ERR] GEMINI_API_KEY missing")
 
+    system = build_system_prompt(content)
     client = genai.Client(api_key=s.gemini_api_key)
     prompt = json.dumps({
         "facility": {
@@ -76,7 +83,7 @@ async def generate_report_content(
             model=s.gemini_model,
             contents=prompt,
             config=types.GenerateContentConfig(
-                system_instruction=_SYSTEM,
+                system_instruction=system,
                 response_mime_type="application/json",
                 response_schema=ReportContent,
                 temperature=0.3,

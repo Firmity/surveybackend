@@ -7,7 +7,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from .config import get_settings
-from .routers import questions, surveys, templates
+from .routers import questions, surveys, templates, translate
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 
@@ -25,6 +25,7 @@ app.include_router(questions.router)
 app.include_router(questions.domains_router)
 app.include_router(surveys.router)
 app.include_router(templates.router)
+app.include_router(translate.router)
 
 
 @app.get("/health", tags=["meta"])

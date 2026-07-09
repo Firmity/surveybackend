@@ -6,6 +6,7 @@ pydantic-settings==2.14.2
 email-validator==2.3.0
 supabase==2.31.0
 google-genai==2.10.0
+deep-translator==1.11.4   # free translation (Google endpoint) — NOT Gemini; keeps LLM quota for reports
 
 # Report rendering (Phase 5b) lives in requirements-report.txt — install later.
 # WeasyPrint needs extra system libraries (GTK) on Windows, so it's kept

@@ -14,6 +14,7 @@ from supabase import Client
 from ..models import ReportOut
 from .gemini import ReportContent, SectionFinding, generate_report_content
 from .render import render_docx, render_pdf
+from .report_template import ContentConfig, merge_config
 from .scoring import answer_units, compute_health, derive_actions
 from .storage import download, upload_and_sign
 
@@ -51,9 +52,12 @@ def _build_groups(
         if f"{area}||{dom}" in na:
             continue
         key = (area, dom)
-        # Expand checklist answers into one line per sub-question; skip empty units.
+        # Expand checklist answers into one line per sub-question; skip empty units
+        # and anything the surveyor marked Not Applicable (also excluded from scoring).
         for u in answer_units(a, q):
             if not (u["value"] or u["remark"]):
+                continue
+            if str(u.get("value") or "").strip().lower() in ("n/a", "na", "not applicable"):
                 continue
             g.setdefault(key, []).append({
                 "question": u["label"],
@@ -122,21 +126,34 @@ GEMINI_RETRIES = int(os.getenv("GEMINI_RETRIES", "3") or 3)
 _REPORT_SEM = asyncio.Semaphore(int(os.getenv("REPORT_CONCURRENCY", "4") or 4))
 
 
-async def _gemini_content(survey: dict, groups: list[dict], health: dict) -> ReportContent:
+def _is_quota_error(e: Exception) -> bool:
+    """Daily/rate quota (429 RESOURCE_EXHAUSTED). Retrying within seconds only burns
+    MORE of the same quota, so we fail fast to the deterministic fallback instead."""
+    s = str(e).upper()
+    return "429" in s or "RESOURCE_EXHAUSTED" in s or "QUOTA" in s
+
+
+async def _gemini_content(
+    survey: dict, groups: list[dict], health: dict, content: ContentConfig | None = None
+) -> ReportContent:
     """Call Gemini with a per-attempt timeout + bounded exponential backoff.
 
-    - Timeout -> raise immediately (LLM is slow/down; caller falls back fast).
-    - Other errors (rate-limit / transient 5xx) -> retry with jittered backoff.
+    - Timeout or quota (429) -> raise immediately (caller falls back fast; retrying a
+      daily quota just wastes more of it).
+    - Other errors (transient 5xx / parse) -> retry with jittered backoff.
     Raises the last error if every attempt fails, so the caller can fall back."""
     last: Exception | None = None
     for attempt in range(GEMINI_RETRIES):
         try:
             return await asyncio.wait_for(
-                generate_report_content(survey, groups, health), timeout=GEMINI_TIMEOUT_S)
+                generate_report_content(survey, groups, health, content), timeout=GEMINI_TIMEOUT_S)
         except asyncio.TimeoutError:
             raise
         except Exception as e:  # noqa: BLE001 - transient LLM/network errors are retryable
             last = e
+            if _is_quota_error(e):
+                log.warning("[GEMINI_QUOTA] rate/daily limit hit — failing fast to fallback (no retry)")
+                raise
             log.warning("[GEMINI_RETRY] attempt %d/%d failed: %s", attempt + 1, GEMINI_RETRIES, e)
             if attempt < GEMINI_RETRIES - 1:
                 await asyncio.sleep(0.8 * (2 ** attempt) + random.uniform(0, 0.4))
@@ -223,11 +240,17 @@ async def _generate_report_impl(db: Client, survey_id: str, view: str = "domain"
     health = compute_health(answers, questions, na)
     actions = derive_actions(answers, questions, na)
 
+    # Load the admin's default report template up-front: its ContentConfig (focus/tone/
+    # length/audience or a free-form prompt) steers the AI narrative, and its styling
+    # themes the PDF. None -> built-in defaults (current output unchanged).
+    template = _load_default_template(db)
+    content_cfg: ContentConfig = merge_config(template).content
+
     # LLM narrative is best-effort. If Gemini is exhausted/slow/errors, fall back to
     # deterministic content so the surveyor never has to redo the survey. Answers and
     # photos are already persisted, so nothing is lost.
     try:
-        content = await _gemini_content(survey, groups, health)
+        content = await _gemini_content(survey, groups, health, content_cfg)
         ai_ok = True
     except Exception as e:  # noqa: BLE001 - quota/timeout/parse/any -> graceful fallback
         log.error("[GEMINI_FALLBACK] survey=%s: %s", survey_id, e)
@@ -236,7 +259,6 @@ async def _generate_report_impl(db: Client, survey_id: str, view: str = "domain"
 
     photos = await _load_photos(db, answers, questions, na)
 
-    template = _load_default_template(db)  # admin PDF-editor theme (None -> built-in defaults)
     pdf_bytes = await asyncio.to_thread(
         render_pdf, content, survey, photos, view, health, actions, groups, template)
     docx_bytes = await asyncio.to_thread(

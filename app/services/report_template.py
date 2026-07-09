@@ -129,6 +129,77 @@ class Overlay(BaseModel):
     opacity: float = 1.0        # 0..1
 
 
+# --------------------------------------------------------------------------- AI content
+# The exact system prompt that produces TODAY's report. The "Default" template uses
+# this verbatim, so existing output is unchanged.
+DEFAULT_REPORT_PROMPT = (
+    "You are a facilities engineering auditor. Produce a factual facility health "
+    "report ONLY from the survey data provided. For EACH (area, domain) group given, "
+    "output exactly one section with its `area` and `domain` set to match that group. "
+    "Do NOT invent equipment, counts, or findings. If a group's data is sparse, say so "
+    "rather than guessing. An objective health score (0-100) is provided; make your "
+    "`overall_rating` and executive summary CONSISTENT with it (roughly: >=85 Good, "
+    ">=50 Fair, else Needs Attention). Return strictly valid JSON matching the schema."
+)
+
+# Graphs a template can toggle. The first four are today's charts (default ON);
+# the last three are new. Unknown/missing keys fall back to sensible defaults.
+GRAPH_KEYS = ["gauge", "domain_bars", "donut", "heatmap", "priority_matrix", "cost_impact", "trend"]
+GRAPH_DEFAULT_ON = {"gauge", "domain_bars", "donut", "heatmap"}
+# Report body sections a template can show/hide.
+CONTENT_SECTION_KEYS = ["exec_summary", "buildings", "corrective", "key_recs", "photos"]
+
+_LENGTH = {
+    "concise": "Be brief: 1-2 sentence observations, and surface only the most material risks.",
+    "standard": "Use a balanced level of detail.",
+    "detailed": "Be thorough: full observations, likely root causes, and specific recommendations per group.",
+}
+_TONE = {
+    "formal": "Write in formal, professional auditor language.",
+    "plain": "Write in clear, plain, client-friendly language, avoiding heavy jargon.",
+}
+_AUDIENCE = {
+    "client": "Address the facility owner/client who commissioned the survey.",
+    "internal": "Address the internal facilities/operations team who will execute the fixes.",
+    "regulator": "Address a compliance auditor or regulator; be precise and evidence-led.",
+}
+
+
+class ContentConfig(BaseModel):
+    """What the AI writes and which graphs/sections appear — per report template."""
+    # Guided controls (assemble a prompt)
+    focus: list[str] = Field(default_factory=list)                 # emphasis areas
+    length: Literal["concise", "standard", "detailed"] = "standard"
+    tone: Literal["formal", "plain"] = "formal"
+    audience: Literal["client", "internal", "regulator"] = "client"
+    # Toggles (missing key = default: graphs per GRAPH_DEFAULT_ON, sections ON)
+    graphs: dict[str, bool] = Field(default_factory=dict)
+    sections_on: dict[str, bool] = Field(default_factory=dict)
+    # Free-form override; when non-blank it REPLACES the assembled prompt.
+    system_prompt: Optional[str] = None
+
+    def graph_on(self, key: str) -> bool:
+        return self.graphs.get(key, key in GRAPH_DEFAULT_ON)
+
+    def section_on(self, key: str) -> bool:
+        return self.sections_on.get(key, True)
+
+
+def build_system_prompt(content: Optional[ContentConfig]) -> str:
+    """Effective Gemini system prompt: explicit override, else assembled from guided fields."""
+    if content is None:
+        return DEFAULT_REPORT_PROMPT
+    if content.system_prompt and content.system_prompt.strip():
+        return content.system_prompt.strip()
+    parts = [DEFAULT_REPORT_PROMPT]
+    if content.focus:
+        parts.append("Give particular emphasis to: " + ", ".join(content.focus) + ".")
+    parts.append(_LENGTH.get(content.length, _LENGTH["standard"]))
+    parts.append(_TONE.get(content.tone, _TONE["formal"]))
+    parts.append(_AUDIENCE.get(content.audience, _AUDIENCE["client"]))
+    return " ".join(parts)
+
+
 class ReportTemplate(BaseModel):
     name: str = "Modern Editorial"
     palette: Palette = Field(default_factory=Palette)
@@ -139,6 +210,7 @@ class ReportTemplate(BaseModel):
     spacing: float = 1.0            # vertical spacing multiplier for responses (0.8..1.6)
     category_labels: dict[str, str] = Field(default_factory=dict)
     overlays: list[Overlay] = Field(default_factory=list)
+    content: ContentConfig = Field(default_factory=ContentConfig)  # AI prompt + graph/section toggles
 
 
 def merge_config(cfg: Optional[dict]) -> ReportTemplate:
@@ -187,6 +259,41 @@ PRESETS: list[dict] = [
              "slate": "#adb5bd"},
             heading="Archivo", body="DM Sans"),
 ]
+
+
+def _report_preset(name: str, content: ContentConfig, brand: str = "Firmity") -> dict:
+    """A content-focused report template (default styling + a distinct AI prompt)."""
+    t = ReportTemplate(name=name, branding=Branding(brand=brand), content=content)
+    return t.model_dump()
+
+
+# Content-driven report templates (the AI prompt + graph/section mix differ per template).
+# "Modern Editorial" above stays the DEFAULT (empty content -> current output).
+REPORT_TEMPLATES: list[dict] = [
+    _report_preset("Compliance & Safety", ContentConfig(
+        focus=["code compliance", "fire safety", "electrical safety", "security", "regulatory gaps"],
+        length="standard", tone="formal", audience="regulator",
+        graphs={"heatmap": True, "priority_matrix": True})),
+    _report_preset("Executive Summary", ContentConfig(
+        focus=["overall health", "top three risks", "headline actions"],
+        length="concise", tone="plain", audience="client",
+        graphs={"gauge": True, "domain_bars": True, "donut": False, "heatmap": False},
+        sections_on={"exec_summary": True, "buildings": False, "corrective": False,
+                     "key_recs": True, "photos": False})),
+    _report_preset("Detailed Technical", ContentConfig(
+        focus=["per-system condition", "root causes", "engineering recommendations"],
+        length="detailed", tone="formal", audience="internal",
+        graphs={"gauge": True, "domain_bars": True, "donut": True, "heatmap": True,
+                "priority_matrix": True, "cost_impact": True, "trend": True})),
+    _report_preset("Cost & Action Plan", ContentConfig(
+        focus=["prioritized remediation", "effort and impact", "sequencing"],
+        length="standard", tone="plain", audience="internal",
+        graphs={"priority_matrix": True, "cost_impact": True, "gauge": True},
+        sections_on={"exec_summary": True, "buildings": False, "corrective": True,
+                     "key_recs": True, "photos": False})),
+]
+
+PRESETS.extend(REPORT_TEMPLATES)
 
 
 def sample_render_inputs() -> dict:
