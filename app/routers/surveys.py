@@ -5,6 +5,7 @@ import json
 import logging
 import secrets
 import string
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from supabase import Client
@@ -24,6 +25,43 @@ _CODE_ALPHABET = string.ascii_uppercase + string.digits  # no lookalikes strippe
 def _gen_survey_code(n: int = 6) -> str:
     """On-site code shared with the client (kept server-side; never sent to surveyor)."""
     return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(n))
+
+
+def authorize_survey(
+    survey_id: str,
+    db: Client = Depends(get_db),
+    user: dict = Depends(get_current_user),
+) -> dict:
+    """Authorize access to one survey AND return its row (so handlers reuse it).
+
+    Closes the IDOR where any authenticated user could read/modify ANY survey by
+    id. Policy:
+      - the assigned surveyor  -> allow
+      - admin / manager role   -> allow (any survey)
+      - survey still unassigned -> allow (any surveyor may pick it up; matches the
+        Surveys board UX and keeps enforcement fail-safe before assignment)
+      - otherwise              -> 403
+    Fail-safe: a missing `assigned_to` column reads as None -> unassigned -> allow,
+    so enabling this never locks out existing surveys before the schema catches up.
+    """
+    res = db.table("surveys").select("*").eq("id", survey_id).limit(1).execute()
+    if not res.data:
+        raise HTTPException(status_code=404, detail="survey not found")
+    survey = res.data[0]
+    uid = user.get("id")
+    assigned = survey.get("assigned_to")
+    if not assigned or assigned == uid:
+        return survey
+    try:
+        prof = db.table("profiles").select("role").eq("id", uid).limit(1).execute()
+        role = (prof.data or [{}])[0].get("role")
+    except Exception as e:  # noqa: BLE001 - role lookup failure shouldn't 500 the request
+        log.warning("[AUTHZ] role lookup failed for user %s: %s", uid, e)
+        role = None
+    if role in ("admin", "manager"):
+        return survey
+    log.warning("[AUTHZ] user %s denied survey %s (assigned=%s)", uid, survey_id, assigned)
+    raise HTTPException(status_code=403, detail="not authorized for this survey")
 
 
 @router.post("", response_model=SurveyOut, status_code=201)
@@ -55,7 +93,8 @@ def create_survey(body: SurveyCreate, db: Client = Depends(get_db)) -> SurveyOut
 
 
 @router.post("/{survey_id}/verify-code", status_code=200)
-def verify_code(survey_id: str, body: dict, db: Client = Depends(get_db)) -> dict:
+def verify_code(survey_id: str, body: dict, db: Client = Depends(get_db),
+                _sv: dict = Depends(authorize_survey)) -> dict:
     """Check the on-site code the surveyor entered against the survey's code.
     The code itself is never returned — only a boolean."""
     code = str((body or {}).get("code") or "").strip().upper()
@@ -69,12 +108,22 @@ def verify_code(survey_id: str, body: dict, db: Client = Depends(get_db)) -> dic
     if not res.data:
         raise HTTPException(status_code=404, detail="survey not found")
     expected = str(res.data[0].get("survey_code") or "").strip().upper()
-    return {"ok": bool(expected) and secrets.compare_digest(code, expected)}
+    ok = bool(expected) and secrets.compare_digest(code, expected)
+    # Persist the pass so any device the surveyor uses skips the code prompt.
+    if ok:
+        try:
+            db.table("surveys").update(
+                {"gate_verified_at": datetime.now(timezone.utc).isoformat()}
+            ).eq("id", survey_id).execute()
+        except Exception as e:  # noqa: BLE001
+            log.warning("[GATE] could not set gate_verified_at %s: %s", survey_id, e)
+    return {"ok": ok}
 
 
 @router.post("/{survey_id}/visit", status_code=201)
 def record_visit(survey_id: str, body: dict, db: Client = Depends(get_db),
-                 user: dict = Depends(get_current_user)) -> dict:
+                 user: dict = Depends(get_current_user),
+                 _sv: dict = Depends(authorize_survey)) -> dict:
     """Record the surveyor's GPS location for this survey (internal audit only)."""
     try:
         lat = float(body["lat"])
@@ -98,24 +147,28 @@ def record_visit(survey_id: str, body: dict, db: Client = Depends(get_db),
     except Exception as e:  # noqa: BLE001
         log.error("[DB_ERR] record_visit %s: %s", survey_id, e)
         raise HTTPException(status_code=502, detail="could not save location") from e
+    # Cross-device gate flag: another device (e.g. the surveyor's phone) reads this
+    # off the survey so it won't re-prompt for location. Best-effort — never fail the
+    # visit if the flag write hiccups.
+    try:
+        db.table("surveys").update(
+            {"gate_located_at": datetime.now(timezone.utc).isoformat()}
+        ).eq("id", survey_id).execute()
+    except Exception as e:  # noqa: BLE001
+        log.warning("[GATE] could not set gate_located_at %s: %s", survey_id, e)
     return {"ok": True, "id": (res.data or [{}])[0].get("id")}
 
 
 @router.get("/{survey_id}", response_model=SurveyOut)
-def get_survey(survey_id: str, db: Client = Depends(get_db)) -> SurveyOut:
-    """Surveyor screen loads this to know facility_type + chosen domains."""
-    try:
-        res = db.table("surveys").select("*").eq("id", survey_id).limit(1).execute()
-    except Exception as e:
-        log.error("[DB_ERR] get_survey %s: %s", survey_id, e)
-        raise HTTPException(status_code=502, detail="survey lookup failed") from e
-    if not res.data:
-        raise HTTPException(status_code=404, detail="survey not found")
-    return SurveyOut(**res.data[0])
+def get_survey(survey: dict = Depends(authorize_survey)) -> SurveyOut:
+    """Surveyor screen loads this to know facility_type + chosen domains.
+    authorize_survey both authorizes the caller and returns the row."""
+    return SurveyOut(**survey)
 
 
 @router.get("/{survey_id}/answers", status_code=200)
-def get_answers(survey_id: str, db: Client = Depends(get_db)) -> dict:
+def get_answers(survey_id: str, db: Client = Depends(get_db),
+                _sv: dict = Depends(authorize_survey)) -> dict:
     """Resume support: return saved answers so the surveyor can continue later."""
     try:
         res = (
@@ -131,7 +184,8 @@ def get_answers(survey_id: str, db: Client = Depends(get_db)) -> dict:
 
 
 @router.put("/{survey_id}/deployment", status_code=200)
-def save_deployment(survey_id: str, body: dict, db: Client = Depends(get_db)) -> dict:
+def save_deployment(survey_id: str, body: dict, db: Client = Depends(get_db),
+                    _sv: dict = Depends(authorize_survey)) -> dict:
     """Save the Staff Profile deployment grids (whole object replace)."""
     try:
         db.table("surveys").update({"deployment_plan": body}).eq("id", survey_id).execute()
@@ -142,7 +196,8 @@ def save_deployment(survey_id: str, body: dict, db: Client = Depends(get_db)) ->
 
 
 @router.put("/{survey_id}/status", status_code=200)
-def set_status(survey_id: str, body: dict, db: Client = Depends(get_db)) -> dict:
+def set_status(survey_id: str, body: dict, db: Client = Depends(get_db),
+               _sv: dict = Depends(authorize_survey)) -> dict:
     """Set survey status (submitted|in_progress|ready|reported)."""
     status = body.get("status")
     if status not in {"submitted", "in_progress", "ready", "reported"}:
@@ -156,7 +211,8 @@ def set_status(survey_id: str, body: dict, db: Client = Depends(get_db)) -> dict
 
 
 @router.put("/{survey_id}/progress", status_code=200)
-def save_progress(survey_id: str, body: dict, db: Client = Depends(get_db)) -> dict:
+def save_progress(survey_id: str, body: dict, db: Client = Depends(get_db),
+                  _sv: dict = Depends(authorize_survey)) -> dict:
     """Save section-completion map { section: true } for the sidebar (whole object replace)."""
     try:
         db.table("surveys").update({"progress": body}).eq("id", survey_id).execute()
@@ -167,7 +223,8 @@ def save_progress(survey_id: str, body: dict, db: Client = Depends(get_db)) -> d
 
 
 @router.put("/{survey_id}/na", status_code=200)
-def save_na_sections(survey_id: str, body: dict, db: Client = Depends(get_db)) -> dict:
+def save_na_sections(survey_id: str, body: dict, db: Client = Depends(get_db),
+                     _sv: dict = Depends(authorize_survey)) -> dict:
     """Replace the not-applicable section list.
 
     Body: { "na_sections": ["<area>||<domain>", ...] }. These sections are excluded
@@ -185,7 +242,8 @@ def save_na_sections(survey_id: str, body: dict, db: Client = Depends(get_db)) -
 
 
 @router.post("/{survey_id}/answers", status_code=200)
-def sync_answers(survey_id: str, body: AnswerSync, db: Client = Depends(get_db)) -> dict:
+def sync_answers(survey_id: str, body: AnswerSync, db: Client = Depends(get_db),
+                 _sv: dict = Depends(authorize_survey)) -> dict:
     """
     Idempotent bulk upsert from the surveyor device (online or after offline sync).
     Conflict target (survey_id, question_id) -> re-sending never duplicates.
@@ -226,7 +284,8 @@ def _load_scoring_inputs(survey_id: str, db: Client) -> tuple[list[dict], dict[s
 
 
 @router.get("/{survey_id}/health", status_code=200)
-def get_health(survey_id: str, db: Client = Depends(get_db)) -> dict:
+def get_health(survey_id: str, db: Client = Depends(get_db),
+               _sv: dict = Depends(authorize_survey)) -> dict:
     """Live deterministic health score (0-100) + per-domain breakdown."""
     try:
         answers, questions, na = _load_scoring_inputs(survey_id, db)
@@ -239,7 +298,8 @@ def get_health(survey_id: str, db: Client = Depends(get_db)) -> dict:
 
 
 @router.get("/{survey_id}/actions", status_code=200)
-def get_actions(survey_id: str, db: Client = Depends(get_db)) -> dict:
+def get_actions(survey_id: str, db: Client = Depends(get_db),
+                _sv: dict = Depends(authorize_survey)) -> dict:
     """Live corrective-action list derived from failing/weak answers."""
     try:
         answers, questions, na = _load_scoring_inputs(survey_id, db)
@@ -256,6 +316,7 @@ async def make_report(
     survey_id: str,
     view: str = Query("domain", pattern="^(domain|area|both)$"),
     db: Client = Depends(get_db),
+    _sv: dict = Depends(authorize_survey),
 ) -> ReportOut:
     """Generate the facility health report. view = domain | area | both."""
     try:

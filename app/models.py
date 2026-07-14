@@ -110,6 +110,8 @@ class SurveyOut(BaseModel):
     deployment_plan: dict[str, Any] = Field(default_factory=dict)   # Staff Profile grids (manager-entered)
     progress: dict[str, Any] = Field(default_factory=dict)          # { section name: true } completion
     na_sections: list[str] = Field(default_factory=list)            # ['<area>||<domain>'] excluded from AI/report
+    gate_located_at: Optional[datetime] = None                      # on-site GPS confirmed (cross-device gate)
+    gate_verified_at: Optional[datetime] = None                     # survey code confirmed (cross-device gate)
     status: str
     created_at: datetime
 

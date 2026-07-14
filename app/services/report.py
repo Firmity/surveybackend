@@ -275,6 +275,12 @@ async def _generate_report_impl(db: Client, survey_id: str, view: str = "domain"
     except Exception as e:
         log.error("[REPORT_UPLOAD_ERR] survey=%s: %s", survey_id, e)
 
+    # Don't persist a "ready" report the user can't open. If BOTH files failed to
+    # upload, fail loudly so the caller returns an error instead of a report row
+    # with null URLs that the UI would auto-download into nothing.
+    if pdf_url is None and docx_url is None:
+        raise RuntimeError("[REPORT_UPLOAD_ERR] both PDF and DOCX uploads failed — not saving a fileless report")
+
     rep_res = db.table("reports").insert({
         "survey_id": survey_id,
         "payload": {"view": view, "health": health, "actions": actions,

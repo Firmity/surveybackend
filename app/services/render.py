@@ -1693,8 +1693,16 @@ def _docx_corrective(doc, actions) -> None:
                "Blue dashed line = recommended re-inspection.", italic=True, color=MUTED, size=9)
 
     _heading(doc, "Action detail", size=14, color=INK, accent=INK)
+    # areas in first-seen order -> stable colour assignment (mirrors the PDF)
+    area_order: list[str] = []
+    for ac in actions:
+        ar = str(ac.get("area", "") or "—")
+        if ar not in area_order:
+            area_order.append(ar)
     for i, ac in enumerate(actions, 1):
         sev = ac.get("severity", "medium")
+        area = str(ac.get("area", "") or "—")
+        acol = _area_color(area, area_order)
         p = doc.add_paragraph()
         p.paragraph_format.space_after = Pt(1)
         tag = p.add_run(f" {sev.upper()} ")
@@ -1702,25 +1710,47 @@ def _docx_corrective(doc, actions) -> None:
         tag.font.size = Pt(9)
         tag.font.color.rgb = _rgb(WHITE)
         _run_shade(tag, RED if sev == "high" else AMBER)
-        head = p.add_run(f"   {i}.  {_dl(ac.get('domain', ''))}  ·  {ac.get('area', '')}")
+        head = p.add_run(f"   {i}.  {_dl(ac.get('domain', ''))}   ")
         head.bold = True
         head.font.size = Pt(10.5)
         head.font.color.rgb = _rgb(INK)
-        _para(doc, f"Finding: {ac.get('finding')} - {ac.get('question')}", color=INK, size=9.5, space_after=1)
-        _para(doc, f"Action: {ac.get('action')}", italic=True, color=MUTED, size=9.5, space_after=5)
+        chip = p.add_run(f" {area} ")   # area label in its own colour (never black)
+        chip.bold = True
+        chip.font.size = Pt(9)
+        chip.font.color.rgb = _rgb(WHITE)
+        _run_shade(chip, acol)
+        # finding + action highlighted with a light area tint
+        pf = doc.add_paragraph()
+        pf.paragraph_format.space_after = Pt(1)
+        rf = pf.add_run(f"Finding: {ac.get('finding')} - {ac.get('question')}")
+        rf.bold = True
+        rf.font.size = Pt(9.5)
+        rf.font.color.rgb = _rgb(INK)
+        _run_shade(rf, _tint(acol, 0.90))
+        pa = doc.add_paragraph()
+        pa.paragraph_format.space_after = Pt(5)
+        ra = pa.add_run(f"Action: {ac.get('action')}")
+        ra.italic = True
+        ra.font.size = Pt(9.5)
+        ra.font.color.rgb = _rgb(MUTED)
+        _run_shade(ra, _tint(acol, 0.90))
 
 
 def _docx_key_recs(doc, content) -> None:
+    tint = _tint(LIME_G, 0.86)
     for i, rec in enumerate(content.key_recommendations, 1):
         p = doc.add_paragraph()
         p.paragraph_format.space_after = Pt(3)
-        num = p.add_run(f"{i}   ")
+        num = p.add_run(f" {i} ")
         num.bold = True
         num.font.size = Pt(12)
-        num.font.color.rgb = _rgb(BLUE)
-        r = p.add_run(str(rec))
+        num.font.color.rgb = _rgb(WHITE)
+        _run_shade(num, BLUE)
+        p.add_run("  ")
+        r = p.add_run(str(rec))                # highlighted recommendation text
         r.font.size = Pt(11)
         r.font.color.rgb = _rgb(INK)
+        _run_shade(r, tint)
 
 
 def _docx_photos(doc, items) -> None:

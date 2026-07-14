@@ -72,7 +72,7 @@ SECTIONS = {
         "timeline, and the specific action for every deficiency found.",
     ),
     "key_recs": (
-        "Section 03", "Key Recommendations",
+        "Section 03", "URest Recommendations",
         "The highest-impact actions to improve this facility's health, in priority order.",
     ),
 }
