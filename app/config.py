@@ -18,7 +18,7 @@ class Settings(BaseSettings):
     # Gemini
     gemini_api_key: str = Field(default="", alias="GEMINI_API_KEY")
     gemini_model: str = Field(default="gemini-2.5-flash", alias="GEMINI_MODEL")
-    gemini_timeout_s: float = Field(default=30.0, alias="GEMINI_TIMEOUT_S")
+    gemini_timeout_s: float = Field(default=120.0, alias="GEMINI_TIMEOUT_S")
 
     # CORS — your Next.js origin(s), comma-separated
     cors_origins: str = Field(default="http://localhost:3000", alias="CORS_ORIGINS")

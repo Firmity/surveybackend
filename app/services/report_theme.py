@@ -27,6 +27,14 @@ AMBER = (245, 158, 11)     # Satisfactory / medium priority
 RED = (220, 38, 38)        # Unsatisfactory / high priority
 SLATE = (148, 163, 184)    # Not Applicable
 
+# Area-tree node colours — building / floor / room are colour-coded so the
+# spatial hierarchy is distinct at a glance, in the report AND on the frontend.
+# Depth 0 = building, 1 = floor, 2+ = room/area (deepest colour repeats for
+# any extra nesting). Keep these in sync with the frontend palette (survey-api).
+AREA_BUILDING = (30, 58, 95)    # #1E3A5F deep navy
+AREA_FLOOR = (15, 118, 110)     # #0F766E teal
+AREA_ROOM = (180, 83, 9)        # #B45309 amber
+
 # ---------------------------- 2. BRANDING ----------------------------
 BRAND = "Firmity"
 REPORT_TITLE = "Facility Health Report"
@@ -74,5 +82,10 @@ SECTIONS = {
     "key_recs": (
         "Section 03", "URest Recommendations",
         "The highest-impact actions to improve this facility's health, in priority order.",
+    ),
+    "appendix": (
+        "Appendix", "Submitted Survey Form",
+        "The complete record of every question and the response recorded on site, grouped by "
+        "area - including any custom questions and checklist sub-questions the surveyor added.",
     ),
 }

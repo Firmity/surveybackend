@@ -42,23 +42,32 @@ _WEAK = {"satisfactory"}               # medium-severity (improvement) actions
 GATE_KEY = "__gate"
 _GATE_NA = {"n/a", "na", "not applicable"}
 
-# Default remediation copy per severity; the surveyor's remark (if any) is
-# appended so the action stays specific.
-_DEFAULT_ACTION = {
-    "high": "Rectify the deficiency and re-inspect; assign an owner and target date.",
-    "medium": "Schedule preventive maintenance to bring this up to standard.",
-}
+# NOTE: we deliberately do NOT emit generic filler like "rectify the problem" or
+# "schedule preventive maintenance". Deterministic scoring can't know the real fix,
+# so the corrective action carries the SPECIFIC finding + the surveyor's on-site
+# remark; the actionable remediation comes from the AI recommendations.
 
 
 def _norm(v: Any) -> str:
     return str(v or "").strip().lower()
 
 
-def grade_value(v: Any) -> Optional[float]:
+def grade_value(v: Any, good: Any = None) -> Optional[float]:
     """Public: grade a single answer value -> 1.0 / 0.5 / 0.0, or None if not
     gradeable (numbers, text, N/A). Used by the report renderer for per-section
-    scores and the rating-distribution chart."""
-    return _GRADE.get(_norm(v))
+    scores and the rating-distribution chart.
+
+    `good` is the question's compliant answer ('yes' | 'no'); for a Yes/No question
+    where 'no' is the good answer (e.g. "Is there scrap on the floor?"), the score
+    is inverted so a compliant 'No' grades 1.0 (pass), not 0.0. Ratings are
+    unaffected (Good/Satisfactory/Unsatisfactory carry their own polarity)."""
+    n = _norm(v)
+    base = _GRADE.get(n)
+    if base is None:
+        return None
+    if n in ("yes", "no") and str(good or "yes").strip().lower() == "no":
+        return 1.0 - base  # invert: compliant No -> 1.0, non-compliant Yes -> 0.0
+    return base
 
 
 def _area_of(answer: dict) -> str:
@@ -91,12 +100,13 @@ def answer_units(answer: dict, question: dict) -> list[dict[str, Any]]:
             return []  # Not Applicable -> skip the whole checklist
         rmap = _load_map(answer.get("remark"))
         if gate == "no":
-            # Asset absent: a single finding (parent = No), scored + reported.
-            # Sub-questions are meaningless when the item isn't there, so skip them.
+            # Asset absent: a single finding (parent = No). "Not present" is inherently
+            # a deficiency, so no polarity is applied (good=None -> No grades 0).
             return [{
                 "label": question.get("text", ""),
                 "value": "No",
                 "remark": rmap.get(GATE_KEY) or "",
+                "good": None,
             }]
         parent = question.get("text", "")
         units: list[dict[str, Any]] = []
@@ -106,12 +116,14 @@ def answer_units(answer: dict, question: dict) -> list[dict[str, Any]]:
                 "label": f"{parent} - {sub.get('text', '')}".strip(" -"),
                 "value": vmap.get(sid),
                 "remark": rmap.get(sid) or "",
+                "good": sub.get("good_answer"),  # per sub-question polarity
             })
         return units
     return [{
         "label": question.get("text", ""),
         "value": answer.get("value"),
         "remark": answer.get("remark") or "",
+        "good": question.get("good_answer"),  # per-question polarity
     }]
 
 
@@ -149,7 +161,7 @@ def compute_health(
         if f"{area}||{dom}" in na:
             continue
         for u in answer_units(a, q):
-            pts = _GRADE.get(_norm(u["value"]))
+            pts = grade_value(u["value"], u.get("good"))
             if pts is None:
                 continue
             per_domain.setdefault(dom, []).append(pts)
@@ -195,14 +207,15 @@ def derive_actions(
         if f"{area}||{dom}" in na:
             continue
         for u in answer_units(a, q):
-            v = _norm(u["value"])
-            if v in _NEGATIVE:
-                severity = "high"
-            elif v in _WEAK:
-                severity = "medium"
-            else:
-                continue
+            pts = grade_value(u["value"], u.get("good"))
+            if pts is None or pts >= 1.0:
+                continue  # not gradeable, or compliant -> not a corrective action
+            severity = "high" if pts <= 0.0 else "medium"
             remark = (u["remark"] or "").strip()
+            # Specific, honest action text: lead with the surveyor's on-site remark
+            # (the concrete detail) when present; otherwise reference the exact item
+            # and its recorded finding. No generic filler.
+            action = remark or f"Investigate and correct the cause of '{u['label']}' (recorded: {u['value']})."
             out.append({
                 "area": area,
                 "domain": dom,
@@ -210,8 +223,7 @@ def derive_actions(
                 "finding": u["value"],
                 "severity": severity,
                 "remark": remark,
-                "action": f"{_DEFAULT_ACTION[severity]}"
-                          + (f" Note: {remark}" if remark else ""),
+                "action": action,
             })
 
     order = {"high": 0, "medium": 1}

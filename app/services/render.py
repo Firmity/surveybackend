@@ -34,8 +34,19 @@ from .scoring import grade_value
 from .report_theme import (  # editable theme: colours, category labels, section text
     INK, BLUE, LIME, CREAM, CARD, LINE, MUTED, GREEN, LIME_G, AMBER, RED, SLATE,
     BRAND, REPORT_TITLE, BACK_COVER_LINE, SECTIONS,
+    AREA_BUILDING, AREA_FLOOR, AREA_ROOM,
     CATEGORY_LABELS as DOMAIN_LABELS,
 )
+
+# Area-depth -> colour, for the colour-coded area tree (building/floor/room).
+_AREA_DEPTH_RGB = (AREA_BUILDING, AREA_FLOOR, AREA_ROOM)
+_DEFAULT_AREA_RGB = (AREA_BUILDING, AREA_FLOOR, AREA_ROOM)  # snapshot for template reset
+
+
+def _area_depth_rgb(depth: int) -> tuple:
+    """Colour for a node at `depth` (0=building). Deepest colour repeats for any
+    extra nesting so it never indexes out of range."""
+    return _AREA_DEPTH_RGB[min(max(depth, 0), len(_AREA_DEPTH_RGB) - 1)]
 
 log = logging.getLogger("render")
 _FONT_DIR = os.path.join(os.path.dirname(__file__), "..", "assets", "fonts")
@@ -137,6 +148,14 @@ def apply_template(cfg: Optional[dict]) -> None:
             g[key] = _DEFAULT_RGB[key]
             if _DEFAULT_CHART_HEX.get(key) is not None:
                 setattr(charts, key, _DEFAULT_CHART_HEX[key])
+
+    # Area-tree colours (building/floor/room) live in the palette but aren't in _PALETTE,
+    # so rebind them + the depth tuple here. Absent -> restore the built-in defaults.
+    for i, key in enumerate(("area_building", "area_floor", "area_room")):
+        gk = key.upper()
+        hexval = pal.get(key)
+        g[gk] = _hx_rgb(hexval) if hexval else _DEFAULT_AREA_RGB[i]
+    g["_AREA_DEPTH_RGB"] = (g["AREA_BUILDING"], g["AREA_FLOOR"], g["AREA_ROOM"])
 
     brand = cfg.get("branding") or {}
     BRAND = brand.get("brand") or _DEFAULT_BRAND["BRAND"]
@@ -574,7 +593,7 @@ def _fact_tiles(pdf, facts):
 
 # ================================================================= data
 def _group_score(answers) -> Optional[int]:
-    pts = [grade_value(a.get("value")) for a in answers]
+    pts = [grade_value(a.get("value"), a.get("good_answer")) for a in answers]
     pts = [p for p in pts if p is not None]
     return round(sum(pts) / len(pts) * 100) if pts else None
 
@@ -582,7 +601,7 @@ def _group_score(answers) -> Optional[int]:
 def _status_counts(answers):
     g = s = p = 0
     for a in answers:
-        pt = grade_value(a.get("value"))
+        pt = grade_value(a.get("value"), a.get("good_answer"))
         if pt == 1.0:
             g += 1
         elif pt == 0.5:
@@ -596,7 +615,7 @@ def _rating_counts(groups):
     good = satis = poor = na = 0
     for gr in groups:
         for a in gr.get("answers", []):
-            pt = grade_value(a.get("value"))
+            pt = grade_value(a.get("value"), a.get("good_answer"))
             v = str(a.get("value") or "").strip().lower()
             if pt == 1.0:
                 good += 1
@@ -619,15 +638,58 @@ FACILITY_LAST = ["Staff Profile", "Client Pain Areas", "UREST Suggestion"]
 _HIDE_AREAS = {"urest suggestion"}
 
 
-def _ordered_areas(areas):
+# Module-level fallback so any reference to `area_order` inside render_pdf/
+# render_docx resolves even if a stale/partial file is loaded (OneDrive lag):
+# a present function param shadows this; a missing one falls back to [] (alpha order).
+area_order: list = []
+
+
+def _ordered_areas(areas, area_order=None):
     areas = [a for a in areas if str(a).strip().lower() not in _HIDE_AREAS]
     first = [a for a in FACILITY_FIRST if a in areas]
     last = [a for a in FACILITY_LAST if a in areas]
-    mids = sorted(a for a in areas if a not in first and a not in last)
+    mids = [a for a in areas if a not in first and a not in last]
+    if area_order:
+        # Order by the survey's area tree (Building > Floor > Room); anything not in
+        # the tree order (legacy names) sorts after, alphabetically.
+        idx = {a: i for i, a in enumerate(area_order)}
+        mids.sort(key=lambda a: (idx.get(a, 10 ** 9), str(a)))
+    else:
+        mids.sort()
     return first + mids + last
 
 
 # ================================================================= sections
+def _parse_iso(v):
+    if not v:
+        return None
+    try:
+        return datetime.fromisoformat(str(v).replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
+
+
+def _fmt_dur(secs) -> str:
+    if secs is None:
+        return ""
+    h, m = divmod(int(secs) // 60, 60)
+    return f"{h}h {m}m" if h else f"{m}m"
+
+
+def _fmt_date(iso) -> str:
+    d = _parse_iso(iso)
+    return d.strftime("%d %b %Y") if d else ""
+
+
+def _date_range(a, b) -> str:
+    da, db_ = _parse_iso(a), _parse_iso(b)
+    if not da:
+        return ""
+    if not db_ or da.date() == db_.date():
+        return da.strftime("%d %b %Y")
+    return f"{da.strftime('%d %b')} - {db_.strftime('%d %b %Y')}"
+
+
 def _cover(pdf, survey, content, health, photos):
     pdf.chrome = False
     pdf.add_page()
@@ -650,6 +712,37 @@ def _cover(pdf, survey, content, health, photos):
     pdf.set_font(F, "", 16)
     pdf.set_text_color(*MUTED)
     pdf.cell(0, 8, survey.get("facility_name") or "Facility")
+
+    # --- overall score badge (top-right) ---
+    meta = survey.get("_report_meta") or {}
+    score = (health or {}).get("overall")
+    if score is not None:
+        bw = 48
+        bx = PAGE_W - M - bw
+        _rrect(pdf, bx, 34, bw, bw, _sc_rgb(score), r=9)
+        pdf.set_xy(bx, 43)
+        pdf.set_font(F, "B", 32)
+        pdf.set_text_color(*WHITE)
+        pdf.cell(bw, 15, str(score), align="C")
+        pdf.set_xy(bx, 61)
+        pdf.set_font(F, "B", 8.5)
+        pdf.cell(bw, 5, "HEALTH SCORE / 100", align="C")
+
+    # --- metadata strip (surveyor / dates / duration / generated) ---
+    parts: list[str] = []
+    if meta.get("surveyor"):
+        parts.append(f"Surveyor: {meta['surveyor']}")
+    dr = _date_range(meta.get("started_at"), meta.get("generated_at"))
+    if dr:
+        parts.append(f"Survey: {dr}")
+    if meta.get("duration_seconds") is not None:
+        parts.append(f"Total time: {_fmt_dur(meta['duration_seconds'])}")
+    gen = _fmt_date(meta.get("generated_at")) or datetime.now().strftime("%d %b %Y")
+    parts.append(f"Generated {gen}")
+    pdf.set_xy(M, 104)
+    pdf.set_font(F, "", 10.5)
+    pdf.set_text_color(*INK)
+    pdf.cell(0, 6, "   ·   ".join(parts))
 
     # Branded block band. Survey photos are intentionally NOT placed on the cover:
     # arbitrary uploaded images (logos, diagrams) get stretched into the narrow tiles
@@ -758,6 +851,207 @@ def _exec_summary(pdf, content, groups):
     pdf.multi_cell(CW - 106, 8, content.executive_summary, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
 
 
+def _tree_leaves_under(prefix_parts: list[str], all_paths) -> list[str]:
+    """Leaf labels exactly one level below `prefix_parts` (the current node's
+    siblings), de-duped and in first-seen order. Drives the 'show siblings'
+    behaviour in the per-section tree."""
+    depth = len(prefix_parts)
+    seen: set[str] = set()
+    out: list[str] = []
+    for p in all_paths:
+        parts = [s.strip() for s in str(p).split(">") if s.strip()]
+        if len(parts) == depth + 1 and parts[:depth] == prefix_parts:
+            leaf = parts[depth]
+            if leaf not in seen:
+                seen.add(leaf)
+                out.append(leaf)
+    return out
+
+
+def _area_tree_block(pdf, path: str, all_paths) -> None:
+    """Compact indented tree at the top of a building/area page: the ancestor chain
+    then every sibling leaf under the deepest parent, current node highlighted and
+    colour-coded by depth (building=navy, floor=teal, room=amber). Replaces the flat
+    'A > B > C' breadcrumb with a visual hierarchy."""
+    parts = [s.strip() for s in str(path).split(">") if s.strip()]
+    if len(parts) <= 1:
+        return  # a bare building: the divider already names it, no tree needed
+    leaves = _tree_leaves_under(parts[:-1], all_paths) or [parts[-1]]
+    _need(pdf, 10 + 5.5 * (len(parts) - 1 + len(leaves)))
+    x0 = M
+    step = 9.0
+
+    def _node(label: str, depth: int, current: bool, leaf: bool) -> None:
+        rgb = _area_depth_rgb(depth)
+        ind = depth * step
+        y = pdf.get_y()
+        if depth > 0:  # elbow connector from the parent's indent guide
+            gx = x0 + ind - 4
+            pdf.set_draw_color(*LINE)
+            pdf.set_line_width(0.35)
+            pdf.line(gx, y - 1.0, gx, y + 3.0)
+            pdf.line(gx, y + 3.0, x0 + ind - 0.5, y + 3.0)
+        tx = x0 + ind
+        if current:  # highlight the surveyed node with a tinted pill
+            w = pdf.get_string_width(label) + 10
+            _rrect(pdf, tx - 1, y + 0.3, w, 5.6, _tint(rgb, 0.86), r=1.4)
+        _rrect(pdf, tx + 1.5, y + 1.6, 2.6, 2.6, rgb, r=0.5)
+        pdf.set_xy(tx + 6, y)
+        pdf.set_font(F, "B" if (current or not leaf) else "", 9.8)
+        pdf.set_text_color(*(rgb if (current or not leaf) else MUTED))
+        pdf.cell(0, 6, label, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+
+    for depth, label in enumerate(parts[:-1]):
+        _node(label, depth, current=False, leaf=False)
+    leaf_depth = len(parts) - 1
+    for leaf in leaves:
+        _node(leaf, leaf_depth, current=(leaf == parts[-1]), leaf=True)
+    pdf.ln(3)
+
+
+def _area_color_key(pdf, x: float | None = None) -> None:
+    """Small inline legend: which colour means building / floor / room."""
+    pdf.set_x(x if x is not None else M)
+    items = (("Building", AREA_BUILDING), ("Floor", AREA_FLOOR), ("Room / Area", AREA_ROOM))
+    cx = x if x is not None else M
+    y = pdf.get_y()
+    for label, rgb in items:
+        _rrect(pdf, cx, y + 0.6, 3, 3, rgb, r=0.5)
+        pdf.set_xy(cx + 4.5, y)
+        pdf.set_font(F, "", 8.5)
+        pdf.set_text_color(*MUTED)
+        pdf.cell(pdf.get_string_width(label) + 10, 4.6, label)
+        cx += pdf.get_string_width(label) + 16
+    pdf.ln(6)
+
+
+def _areas_surveyed_page(pdf, all_paths) -> None:
+    """Full colour-coded tree of every area surveyed (building > floor > room), in
+    DFS order. Prints each path prefix once so shared parents aren't repeated."""
+    paths = [[s.strip() for s in str(p).split(">") if s.strip()] for p in all_paths]
+    paths = [p for p in paths if p]
+    if not paths:
+        return
+    _content_page(pdf, "Areas Surveyed")
+    _toc_mark(pdf, "Areas Surveyed", level=0)
+    _h1(pdf, "Areas Surveyed", accent=AREA_BUILDING)
+    _caption(pdf, "Every building, floor and area covered by this survey")
+    pdf.ln(2)
+    _area_color_key(pdf)
+    printed: set[tuple] = set()
+    x0 = M + 2
+    step = 9.0
+    for parts in paths:
+        for depth in range(len(parts)):
+            key = tuple(parts[: depth + 1])
+            if key in printed:
+                continue
+            printed.add(key)
+            rgb = _area_depth_rgb(depth)
+            _need(pdf, 7)
+            y = pdf.get_y()
+            ind = depth * step
+            if depth > 0:
+                gx = x0 + ind - 4
+                pdf.set_draw_color(*LINE)
+                pdf.set_line_width(0.35)
+                pdf.line(gx, y - 1.0, gx, y + 3.0)
+                pdf.line(gx, y + 3.0, x0 + ind - 0.5, y + 3.0)
+            _rrect(pdf, x0 + ind + 1.5, y + 1.7, 2.8, 2.8, rgb, r=0.5)
+            pdf.set_xy(x0 + ind + 6, y)
+            pdf.set_font(F, "B" if depth == 0 else "", 10.5 if depth == 0 else 10)
+            pdf.set_text_color(*rgb)
+            pdf.cell(0, 6, parts[depth], new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    pdf.ln(3)
+
+
+def _status_legend(pdf) -> None:
+    """Inline legend for the Good/Satisfactory/Unsatisfactory/N-A status colours."""
+    items = (("Good", GREEN), ("Satisfactory", AMBER), ("Unsatisfactory", RED), ("Not Applicable", SLATE))
+    x, y = M, pdf.get_y()
+    for label, rgb in items:
+        _rrect(pdf, x, y + 0.6, 3, 3, rgb, r=0.5)
+        pdf.set_xy(x + 4.5, y)
+        pdf.set_font(F, "", 9)
+        pdf.set_text_color(*MUTED)
+        w = pdf.get_string_width(label)
+        pdf.cell(w + 6, 4.6, label)
+        x += w + 18
+    pdf.ln(6)
+
+
+def _methodology_page(pdf) -> None:
+    """'How to Read This Report' - scoring methodology + colour legends."""
+    _content_page(pdf, "How to Read This Report")
+    _toc_mark(pdf, "How to Read This Report", level=0)
+    _h1(pdf, "How to Read This Report", accent=BLUE)
+    pdf.set_x(M)
+    _txt(pdf, CW, 5.4,
+         "Every item the surveyor checked is graded and rolled up into a 0-100 health score. The "
+         "score is objective - it comes straight from the recorded answers, not the AI narrative.",
+         size=10, rgb=INK)
+    pdf.ln(2)
+    _caption(pdf, "How the score works")
+    pdf.ln(1)
+    for t in (
+        "Each graded answer scores 1.0 (pass), 0.5 (watch) or 0.0 (fail). A section's score is the "
+        "average x100. Free-text, numbers and Not-Applicable answers are excluded from the score.",
+        "Compliant-answer logic: some questions are healthy when answered 'No' (e.g. 'Is there scrap "
+        "on the floor?'). Each question records which answer is compliant, so a correct 'No' counts "
+        "as a pass, not a finding.",
+        "Overall grade: 85-100 Good, 50-84 Fair, below 50 Needs Attention.",
+    ):
+        pdf.set_x(M + 3)
+        _txt(pdf, CW - 6, 5, "-  " + t, size=9.5, rgb=MUTED)
+        pdf.ln(0.5)
+    pdf.ln(2)
+    _caption(pdf, "Status colours")
+    pdf.ln(1)
+    _status_legend(pdf)
+    pdf.ln(1)
+    _caption(pdf, "Area colours")
+    pdf.ln(1)
+    _area_color_key(pdf)
+
+
+def _glossary_page(pdf) -> None:
+    """Glossary/acronyms + a short limitations & disclaimer."""
+    _content_page(pdf, "Glossary & Notes")
+    _toc_mark(pdf, "Glossary & Notes", level=0)
+    _h1(pdf, "Glossary & Notes", accent=BLUE)
+    _caption(pdf, "Terms used in this report")
+    pdf.ln(1)
+    terms = (
+        ("Health score", "0-100 objective score computed from the surveyor's graded answers."),
+        ("Finding", "A recorded deficiency (a non-compliant answer) needing corrective action."),
+        ("Compliant answer", "The response to a question that indicates a healthy condition."),
+        ("N/A", "Not applicable - excluded from scoring and from findings."),
+        ("Checklist", "A grouped question whose sub-items are each graded when the parent applies."),
+        ("ESG", "Environmental, Social & Governance / sustainability assessment."),
+    )
+    for t, d in terms:
+        _need(pdf, 9)
+        pdf.set_x(M)
+        pdf.set_font(F, "B", 9.5)
+        pdf.set_text_color(*INK)
+        pdf.cell(0, 5, t, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_x(M + 3)
+        pdf.set_font(F, "", 9.5)
+        pdf.set_text_color(*MUTED)
+        pdf.multi_cell(CW - 3, 4.8, d, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(1)
+    pdf.ln(1)
+    _caption(pdf, "Limitations & disclaimer")
+    pdf.ln(1)
+    pdf.set_x(M)
+    _txt(pdf, CW, 5,
+         "This report reflects conditions observed during a point-in-time on-site survey and the "
+         "answers recorded by the surveyor. It is not an exhaustive engineering or legal audit. "
+         "Scores and findings are decision-support, not a warranty of compliance. Photographs are "
+         "evidence captured on site. Verify critical findings independently before acting.",
+         size=9.5, rgb=MUTED)
+
+
 def _building_divider(pdf, index, name, score, ss_key="building"):
     pdf.chrome = False
     pdf.add_page()
@@ -767,7 +1061,9 @@ def _building_divider(pdf, index, name, score, ss_key="building"):
     pdf.set_xy(M, 40)
     pdf.set_font(F, "B", 12)
     pdf.set_text_color(*_ss_col(ss_key, "accent", LIME))
-    pdf.cell(0, 6, f"BUILDING {index:02d}")
+    # The Facility Overview reuses this divider but is NOT a building, so it must
+    # not carry a "BUILDING 01" eyebrow.
+    pdf.cell(0, 6, "OVERVIEW" if ss_key == "facility_overview" else f"BUILDING {index:02d}")
     pdf.set_xy(M, 70)
     pdf.set_font(F, "B", 40)
     pdf.set_text_color(*_ss_col(ss_key, "text", WHITE))
@@ -915,10 +1211,10 @@ def _building_scorecard(pdf, score, g, s, p) -> None:
 def _category_block(pdf, area, domain, answers, sec, photos_for):
     _need(pdf, 42)
     score = _group_score(answers)
-    facts = [a for a in answers if grade_value(a.get("value")) is None and (a.get("value") or a.get("remark"))]
+    facts = [a for a in answers if grade_value(a.get("value"), a.get("good_answer")) is None and (a.get("value") or a.get("remark"))]
     value_facts = [a for a in facts if a.get("value") not in (None, "")]
     note_facts = [a for a in facts if a.get("value") in (None, "") and a.get("remark")]  # remarks-only (e.g. UREST)
-    graded_ans = [a for a in answers if grade_value(a.get("value")) is not None]
+    graded_ans = [a for a in answers if grade_value(a.get("value"), a.get("good_answer")) is not None]
     g, s, p = _status_counts(answers)
     acc = _sc_rgb(score) if score is not None else BLUE
 
@@ -963,7 +1259,7 @@ def _category_block(pdf, area, domain, answers, sec, photos_for):
         pdf.cell(0, 5, f"{g} Good      {s} Satisfactory      {p} Unsatisfactory",
                  new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.ln(_sp(2))
-        flagged = [a for a in graded_ans if grade_value(a.get("value")) in (0.0, 0.5)]
+        flagged = [a for a in graded_ans if grade_value(a.get("value"), a.get("good_answer")) in (0.0, 0.5)]
         if flagged:
             pdf.set_x(M)
             pdf.set_font(F, "B", 9.5)
@@ -1059,7 +1355,11 @@ def _photos_grid(pdf, items):
                 hs.append(min(cw * im.height / im.width, 48))
             except Exception:
                 hs.append(cw * 0.6)
-        return hs, max(hs) + 7
+        # Captions now list every question an image covers, so they can wrap to several
+        # lines — measure them (in the caption font) instead of assuming one line.
+        pdf.set_font(F, "", 7)
+        lines = max((_wrapped_lines(pdf, str(it.get("question") or "Photo"), cw) for it in row), default=1)
+        return hs, max(hs) + 4 + max(1, lines) * 3.2
 
     first_hs, first_rh = _row_h(items[:3])
     _need(pdf, 8 + first_rh)
@@ -1082,7 +1382,7 @@ def _photos_grid(pdf, items):
             pdf.set_xy(x, rowy + hs[j] + 0.5)
             pdf.set_font(F, "", 7)
             pdf.set_text_color(*MUTED)
-            pdf.multi_cell(cw, 3.2, str((it.get("question") or "Photo"))[:70], new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+            pdf.multi_cell(cw, 3.2, str(it.get("question") or "Photo"), new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_y(rowy + rowh)
         i += 3
 
@@ -1148,6 +1448,79 @@ def _area_legend(pdf, actions, area_order):
     pdf.set_y(y + 9)
 
 
+# Suggested owner per category, so each corrective action names a responsible party
+# instead of a bare instruction. A slug not listed falls back to "Facilities Team".
+_ACTION_OWNER = {
+    "housekeeping": "Housekeeping Supervisor", "electrical": "Electrical / M&E Team",
+    "hvac": "HVAC / Mechanical Team", "plumbing": "Plumbing / Water Team",
+    "fire_safety": "Fire & Safety Officer", "security": "Security Manager",
+    "civil": "Civil / Structural Team", "horticulture": "Landscaping Team",
+    "green_building": "Sustainability / ESG Lead", "green_building_key": "Sustainability / ESG Lead",
+    "technology": "IT / Facilities Tech", "sop_registers": "Facility Manager",
+    "inventory": "Stores / Inventory", "general_maintenance": "Maintenance Team",
+    "maintenance_manager": "Maintenance Manager",
+}
+
+
+def _action_owner(domain: str) -> str:
+    return _ACTION_OWNER.get(domain, "Facilities Team")
+
+
+def _action_target(severity: str) -> str:
+    """SLA target derived from severity: high = immediate, medium = planned."""
+    return "Within 7 days" if severity == "high" else "Within 30 days"
+
+
+def _excluded_groups(excluded) -> dict[str, list[str]]:
+    """'area||domain' keys -> {category label: [areas]}, de-duped and sorted. Grouping by
+    CATEGORY keeps the page readable: one category excluded across 20 areas reads as a
+    single heading instead of 20 near-identical rows."""
+    by_cat: dict[str, list[str]] = {}
+    for e in excluded or []:
+        s = str(e)
+        if "||" not in s:
+            continue
+        area, _, dom = s.partition("||")
+        areas = by_cat.setdefault(_dl(dom), [])
+        if area and area not in areas:
+            areas.append(area)
+    for areas in by_cat.values():
+        areas.sort()
+    return dict(sorted(by_cat.items()))
+
+
+def _excluded_page(pdf, excluded) -> None:
+    """Auditable list of categories the surveyor marked Not Applicable, grouped by
+    category with the areas each was excluded in."""
+    by_cat = _excluded_groups(excluded)
+    if not by_cat:
+        return
+    _content_page(pdf, "Excluded Categories")
+    _toc_mark(pdf, "Excluded Categories", level=0)
+    _h1(pdf, "Excluded Categories", accent=SLATE)
+    pdf.set_x(M)
+    _txt(pdf, CW, 5, "Categories the surveyor marked Not Applicable for this facility. They are recorded "
+                     "here for auditability but are excluded from the health score and the findings.",
+         size=9.5, rgb=MUTED)
+    pdf.ln(3)
+    for cat, areas in by_cat.items():
+        _need(pdf, 12)
+        y = pdf.get_y()
+        _rrect(pdf, M, y + 1.6, 2.8, 2.8, SLATE, r=0.5)
+        pdf.set_xy(M + 7, y)
+        pdf.set_font(F, "B", 10.5)
+        pdf.set_text_color(*INK)
+        pdf.cell(0, 5.8, f"{cat}   ({len(areas)} area{'' if len(areas) == 1 else 's'})",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        for a in areas:
+            _need(pdf, 6)
+            pdf.set_x(M + 12)
+            pdf.set_font(F, "", 9)
+            pdf.set_text_color(*MUTED)
+            pdf.multi_cell(CW - 16, 4.6, a, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.ln(2.5)
+
+
 def _corrective(pdf, actions):
     if not actions:
         return
@@ -1201,9 +1574,12 @@ def _corrective(pdf, actions):
         acol = _area_color(area, area_order)
         finding = f"Finding: {ac.get('finding')} — {ac.get('question')}"
         action = f"Action: {ac.get('action')}"
+        # Measure each block under the font it is actually drawn in (see _key_recs).
+        pdf.set_font(F, "B", 9)
         fh = _wrapped_lines(pdf, finding, CW - 16) * 4.8
+        pdf.set_font(F, "", 9)
         ah = _wrapped_lines(pdf, action, CW - 16) * 4.8
-        card_h = 11 + fh + ah + 4
+        card_h = 11 + fh + ah + 10  # +6 for the owner/target line
         _need(pdf, card_h + 2)
         y0 = pdf.get_y()
         _rrect(pdf, M, y0, CW, card_h, _tint(acol, 0.90), r=3)       # light area tint = highlight
@@ -1222,38 +1598,158 @@ def _corrective(pdf, actions):
         pdf.set_font(F, "", 9)
         pdf.set_text_color(*MUTED)
         pdf.multi_cell(CW - 16, 4.8, action, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_x(M + 8)
+        pdf.set_font(F, "B", 8.5)
+        pdf.set_text_color(*acol)
+        pdf.cell(0, 4.6, f"Owner: {_action_owner(ac.get('domain', ''))}     ·     "
+                         f"Target: {_action_target(sev)}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_y(y0 + card_h + 2)
 
 
-def _key_recs(pdf, content):
+def _rec_meta(rec: str, index: int, total: int, actions) -> tuple[str, str, str]:
+    """(severity, owner, target) for one key recommendation.
+
+    The LLM returns key recommendations as plain strings in priority order, so these are
+    derived deterministically rather than guessed:
+      severity - the top third of the list is high, the remainder medium (rank IS priority).
+      owner    - the category whose label appears in the recommendation text; else the
+                 category of the first high-severity corrective action; else generic.
+      target   - the SLA implied by severity (same rule as the corrective actions).
+    """
+    text = (rec or "").lower()
+    domain = ""
+    for ac in actions or []:
+        d = str(ac.get("domain") or "")
+        if not d:
+            continue
+        head = _dl(d).lower().split(" ")[0]
+        if len(head) > 3 and head in text:
+            domain = d
+            break
+    if not domain:
+        hi = next((a for a in (actions or []) if a.get("severity") == "high"), None)
+        domain = str((hi or {}).get("domain") or "")
+    sev = "high" if index < max(1, round((total or 1) / 3)) else "medium"
+    return sev, _action_owner(domain), _action_target(sev)
+
+
+def _key_recs(pdf, content, actions=None):
     if not content.key_recommendations:
         return
     _content_page(pdf, "URest Recommendations")
     _h1(pdf, "URest Recommendations", accent=LIME_G)
     pdf.set_x(M)
     _txt(pdf, CW, 5, "The highest-impact actions to raise this facility's health score, in priority order. "
-                     "Addressing these first will resolve the most critical risks found during the survey.",
+                     "Each carries its priority, the suggested owner and a target timeframe.",
          size=9.5, rgb=MUTED)
     pdf.ln(3)
     tint = _tint(LIME_G, 0.86)
+    total = len(content.key_recommendations)
     for i, rec in enumerate(content.key_recommendations, 1):
-        rh = _wrapped_lines(pdf, rec, CW - 26) * 5.6
-        card_h = max(15, rh + 8)
+        sev, owner, target = _rec_meta(rec, i - 1, total, actions)
+        # Measure with the SAME font the text is drawn in — measuring under a leftover
+        # font under-counts lines and the card ends up too short (text/meta overlap).
+        pdf.set_font(F, "", 11)
+        rh = _wrapped_lines(pdf, rec, CW - 56) * 5.6   # narrower: severity chip sits right
+        card_h = max(21, rh + 14)                      # + owner/target line
         _need(pdf, card_h + 2)
         y0 = pdf.get_y()
         _rrect(pdf, M, y0, CW, card_h, tint, r=3)                 # highlighted panel
         _rrect(pdf, M, y0 + 1.5, 2.6, card_h - 3, LIME_G, r=1)    # accent stripe
-        by = y0 + (card_h - 9) / 2
-        _rrect(pdf, M + 6, by, 9, 9, BLUE, r=4.5)
-        pdf.set_xy(M + 6, by)
+        _rrect(pdf, M + 6, y0 + 4, 9, 9, BLUE, r=4.5)             # rank badge
+        pdf.set_xy(M + 6, y0 + 4)
         pdf.set_font(F, "B", 11)
         pdf.set_text_color(*WHITE)
         pdf.cell(9, 9, str(i), align="C")
-        pdf.set_xy(M + 20, y0 + (card_h - rh) / 2)
+        _tag(pdf, M + CW - 30, y0 + 4, sev.upper(), RED if sev == "high" else AMBER,
+             size=8, h=5.4, w=24)                                  # priority chip
+        pdf.set_xy(M + 20, y0 + 4)
         pdf.set_font(F, "", 11)
         pdf.set_text_color(*INK)
-        pdf.multi_cell(CW - 26, 5.6, rec, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.multi_cell(CW - 56, 5.6, rec, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        pdf.set_xy(M + 20, y0 + card_h - 8)
+        pdf.set_font(F, "B", 8.5)
+        pdf.set_text_color(*LIME_G)
+        pdf.cell(0, 4.6, f"Owner: {owner}     ·     Target: {target}",
+                 new_x=XPos.LMARGIN, new_y=YPos.NEXT)
         pdf.set_y(y0 + card_h + 2)
+
+
+def _appendix_resp_rgb(a: dict) -> tuple:
+    """Colour a recorded response by its grade: green=compliant, amber=watch,
+    red=deficiency, slate=not graded (free text / number / N-A)."""
+    pts = grade_value(a.get("value"), a.get("good_answer"))
+    if pts is None:
+        return SLATE
+    if pts >= 1.0:
+        return GREEN
+    if pts >= 0.5:
+        return AMBER
+    return RED
+
+
+def _appendix_row(pdf, a: dict) -> None:
+    """One question + recorded response line for the submitted-form appendix."""
+    q = str(a.get("question") or "").strip() or "(untitled question)"
+    v = str(a.get("value") or "").strip() or "—"
+    remark = str(a.get("remark") or "").strip()
+    _need(pdf, 12)
+    y = pdf.get_y()
+    qw = CW * 0.70
+    pdf.set_xy(M, y)
+    pdf.set_font(F, "", 9.5)
+    pdf.set_text_color(*INK)
+    pdf.multi_cell(qw, 5, q, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+    qbottom = pdf.get_y()
+    rgb = _appendix_resp_rgb(a)
+    rx = M + qw + 4
+    if len(v) <= 22:  # short answer -> colour pill aligned to the question's top
+        _tag(pdf, rx, y, v, rgb, size=8)
+    else:             # long free-text -> wrapped, coloured by grade
+        pdf.set_xy(rx, y)
+        pdf.set_font(F, "B", 8.5)
+        pdf.set_text_color(*rgb)
+        pdf.multi_cell(CW - qw - 4, 4.6, v, new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        qbottom = max(qbottom, pdf.get_y())
+    if remark:
+        pdf.set_xy(M + 4, qbottom)
+        pdf.set_font(F, "I", 8.5)
+        pdf.set_text_color(*MUTED)
+        pdf.multi_cell(CW - 8, 4.4, f"Remark: {remark}", new_x=XPos.LMARGIN, new_y=YPos.NEXT)
+        qbottom = pdf.get_y()
+    pdf.set_y(qbottom + 1)
+    pdf.set_draw_color(*LINE)
+    pdf.set_line_width(0.2)
+    pdf.line(M, pdf.get_y(), PAGE_W - M, pdf.get_y())
+    pdf.ln(1.6)
+
+
+def _appendix(pdf, areas, grp) -> None:
+    """Full submitted-form dump grouped by area then category. Custom questions and
+    checklist sub-questions are already expanded into `grp` by _build_groups, so
+    they appear here verbatim - the auditable record of what was submitted."""
+    started = False
+    for area in areas:
+        doms = [d for (a, d) in grp.keys() if a == area]
+        if area != "Site Profile":
+            doms = [d for d in doms if d != "general"]
+        doms = [d for d in doms if grp.get((area, d))]
+        if not doms:
+            continue
+        if not started:
+            _content_page(pdf, "Submitted Form")
+            started = True
+        name = "Facility Overview" if area == "Site Profile" else area
+        _subhead(pdf, name, accent=_area_depth_rgb(str(name).count(">")))
+        for d in doms:
+            rows = grp.get((area, d), [])
+            if not rows:
+                continue
+            _caption(pdf, _dl(d))
+            pdf.ln(1)
+            for a in rows:
+                _appendix_row(pdf, a)
+            pdf.ln(2)
 
 
 def _back_cover(pdf, survey):
@@ -1317,7 +1813,8 @@ def _contents_page(pdf, entries) -> None:
 def render_pdf(content: ReportContent, survey: dict,
                photos: Optional[PhotosMap] = None, view: str = "domain",
                health: Optional[dict] = None, actions: Optional[list] = None,
-               groups: Optional[list] = None, template: Optional[dict] = None) -> bytes:
+               groups: Optional[list] = None, template: Optional[dict] = None,
+               area_order: Optional[list] = None) -> bytes:
     # Serialise + inject the admin template, then always restore defaults so one
     # render's theme never leaks into the next (module-global theme state).
     with _render_lock:
@@ -1325,17 +1822,17 @@ def render_pdf(content: ReportContent, survey: dict,
             apply_template(template)
             # Pass 1: render once to collect section page numbers (no contents page).
             _TOC_ENTRIES.clear()
-            _render_pdf_body(content, survey, photos or {}, view, health, actions, groups or [], toc=None)
+            _render_pdf_body(content, survey, photos or {}, view, health, actions, groups or [],area_order=area_order, toc=None)
             # +1 because pass 2 inserts the contents page right after the cover.
             entries = [(n, pg + 1) for (n, lvl, pg) in _TOC_ENTRIES if lvl == 0]
             # Pass 2: render for real with the contents page.
             _TOC_ENTRIES.clear()
-            return _render_pdf_body(content, survey, photos or {}, view, health, actions, groups or [], toc=entries)
+            return _render_pdf_body(content, survey, photos or {}, view, health, actions, groups or [], area_order=area_order, toc=entries)
         finally:
             _reset_template()
 
 
-def _render_pdf_body(content, survey, photos, view, health, actions, groups, toc=None) -> bytes:
+def _render_pdf_body(content, survey, photos, view, health, actions, groups, area_order=None, toc=None) -> bytes:
     pdf = _PDF(orientation="L", format="A4")
     pdf.set_auto_page_break(True, margin=14)
     pdf.set_margins(M, 20, M)
@@ -1346,15 +1843,19 @@ def _render_pdf_body(content, survey, photos, view, health, actions, groups, toc
 
     grp = {(g["area"], g["domain"]): g.get("answers", []) for g in groups}
     secidx = {(s.area, s.domain): s for s in content.sections}
+    areas = _ordered_areas({a for (a, _d) in grp.keys()}, area_order)
 
     _cover(pdf, survey, content, health, photos)
     if toc:  # pass 2 only: real contents page right after the cover
         _contents_page(pdf, toc)
+    if areas and _section_on("areas_surveyed"):  # colour-coded tree of all areas
+        _areas_surveyed_page(pdf, areas)
+    if _section_on("methodology"):  # how-to-read + scoring + colour legends
+        _methodology_page(pdf)
     _overview(pdf, survey, content, health, actions, groups)
     if _section_on("exec_summary"):
         _exec_summary(pdf, content, groups)
 
-    areas = _ordered_areas({a for (a, _d) in grp.keys()})
     if areas and _section_on("buildings"):
         _section_divider(pdf, *SECTIONS["buildings"], accent=_ss_col("buildings", "accent", LIME),
                          bg=_ss_col("buildings", "bg", DIVIDER_BG), key="buildings",
@@ -1373,6 +1874,8 @@ def _render_pdf_body(content, survey, photos, view, health, actions, groups, toc
         bscore = _group_score([a for d in doms for a in grp.get((area, d), [])])
         _building_divider(pdf, idx, name, bscore, ss_key)
         _content_page(pdf, name)
+        if not is_overview:  # visual area hierarchy (ancestors + siblings) at page top
+            _area_tree_block(pdf, name, areas)
         bg_g = bg_s = bg_p = 0
         for d in doms:
             gg, ss, pp = _status_counts(grp.get((area, d), []))
@@ -1395,7 +1898,23 @@ def _render_pdf_body(content, survey, photos, view, health, actions, groups, toc
                          bg=_ss_col("key_recs", "bg", DIVIDER_BG), key="key_recs",
                          text=_ss_col("key_recs", "text", WHITE))
     if _section_on("key_recs"):
-        _key_recs(pdf, content)
+        _key_recs(pdf, content, actions)
+
+    # Submitted-form appendix: every recorded question + response, grouped by area
+    # (incl. custom questions + checklist sub-questions). Placed last so the report
+    # reads narrative-first, with the raw audit trail at the back.
+    if areas and _section_on("appendix"):
+        _section_divider(pdf, *SECTIONS["appendix"], accent=_ss_col("appendix", "accent", LIME),
+                         bg=_ss_col("appendix", "bg", DIVIDER_BG), key="appendix",
+                         text=_ss_col("appendix", "text", WHITE))
+        _appendix(pdf, areas, grp)
+
+    if _section_on("excluded"):  # auditable list of not-applicable sections
+        _excluded_page(pdf, survey.get("_excluded"))
+
+    if _section_on("glossary"):  # glossary/acronyms + limitations & disclaimer
+        _glossary_page(pdf)
+
     _back_cover(pdf, survey)
     return bytes(pdf.output())
 
@@ -1589,6 +2108,18 @@ def _docx_cover(doc, survey, content) -> None:
     for i, (label, val) in enumerate(lines):
         _cell(table.cell(i, 0), label.upper(), bold=True, color=MUTED, size=9, fill=CREAM)
         _cell(table.cell(i, 1), val, color=INK, size=11, fill=CREAM)
+    # Report metadata (surveyor / dates / duration / generated) — parity with the PDF cover.
+    meta = survey.get("_report_meta") or {}
+    bits: list[str] = []
+    if meta.get("surveyor"):
+        bits.append(f"Surveyor: {meta['surveyor']}")
+    dr = _date_range(meta.get("started_at"), meta.get("generated_at"))
+    if dr:
+        bits.append(f"Survey: {dr}")
+    if meta.get("duration_seconds") is not None:
+        bits.append(f"Total time: {_fmt_dur(meta['duration_seconds'])}")
+    bits.append(f"Generated {_fmt_date(meta.get('generated_at')) or datetime.now().strftime('%d %b %Y')}")
+    _para(doc, "   ·   ".join(bits), color=MUTED, size=9.5, space_before=6)
 
 
 def _docx_exec(doc, content, groups) -> None:
@@ -1633,8 +2164,8 @@ def _docx_findings(doc, title, items, accent) -> None:
 
 def _docx_category(doc, area, domain, answers, sec, photos_for) -> None:
     score = _group_score(answers)
-    facts = [a for a in answers if grade_value(a.get("value")) is None and (a.get("value") or a.get("remark"))]
-    graded = [a for a in answers if grade_value(a.get("value")) is not None]
+    facts = [a for a in answers if grade_value(a.get("value"), a.get("good_answer")) is None and (a.get("value") or a.get("remark"))]
+    graded = [a for a in answers if grade_value(a.get("value"), a.get("good_answer")) is not None]
     g, s, p_ = _status_counts(answers)
     title = _dl(domain) + (f"    {score}/100" if score is not None else "")
     _heading(doc, title, size=14, color=INK,
@@ -1652,7 +2183,7 @@ def _docx_category(doc, area, domain, answers, sec, photos_for) -> None:
         _caption_p(doc, "Status summary")
         _para(doc, f"{g} Good      {s} Satisfactory      {p_} Unsatisfactory",
               color=MUTED, size=9.5, space_after=2)
-        flagged = [a for a in graded if grade_value(a.get("value")) in (0.0, 0.5)]
+        flagged = [a for a in graded if grade_value(a.get("value"), a.get("good_answer")) in (0.0, 0.5)]
         if flagged:
             _para(doc, "Needs attention", bold=True, color=INK, size=9.5, space_after=1)
             t = doc.add_table(rows=len(flagged), cols=2)
@@ -1736,21 +2267,140 @@ def _docx_corrective(doc, actions) -> None:
         _run_shade(ra, _tint(acol, 0.90))
 
 
-def _docx_key_recs(doc, content) -> None:
+def _docx_key_recs(doc, content, actions=None) -> None:
     tint = _tint(LIME_G, 0.86)
+    total = len(content.key_recommendations)
     for i, rec in enumerate(content.key_recommendations, 1):
+        sev, owner, target = _rec_meta(rec, i - 1, total, actions)
         p = doc.add_paragraph()
-        p.paragraph_format.space_after = Pt(3)
+        p.paragraph_format.space_after = Pt(1)
         num = p.add_run(f" {i} ")
         num.bold = True
         num.font.size = Pt(12)
         num.font.color.rgb = _rgb(WHITE)
         _run_shade(num, BLUE)
         p.add_run("  ")
+        chip = p.add_run(f" {sev.upper()} ")   # priority chip
+        chip.bold = True
+        chip.font.size = Pt(8)
+        chip.font.color.rgb = _rgb(WHITE)
+        _run_shade(chip, RED if sev == "high" else AMBER)
+        p.add_run("  ")
         r = p.add_run(str(rec))                # highlighted recommendation text
         r.font.size = Pt(11)
         r.font.color.rgb = _rgb(INK)
         _run_shade(r, tint)
+        _para(doc, f"Owner: {owner}     ·     Target: {target}",
+              bold=True, color=LIME_G, size=8.5, space_after=6)
+
+
+def _docx_area_tree(doc, all_paths) -> None:
+    """DOCX 'Areas Surveyed' — indented colour-coded tree of every area."""
+    paths = [[s.strip() for s in str(p).split(">") if s.strip()] for p in all_paths]
+    paths = [p for p in paths if p]
+    if not paths:
+        return
+    _heading(doc, "Areas Surveyed", size=20, color=INK, accent=AREA_BUILDING)
+    printed: set[tuple] = set()
+    for parts in paths:
+        for depth in range(len(parts)):
+            key = tuple(parts[: depth + 1])
+            if key in printed:
+                continue
+            printed.add(key)
+            para = doc.add_paragraph()
+            para.paragraph_format.space_after = Pt(2)
+            para.paragraph_format.left_indent = Inches(0.28 * depth)
+            r = para.add_run(("- " if depth else "") + parts[depth])
+            r.bold = depth == 0
+            r.font.size = Pt(11 if depth == 0 else 10)
+            r.font.color.rgb = _rgb(_area_depth_rgb(depth))
+    doc.add_page_break()
+
+
+def _docx_methodology(doc) -> None:
+    """DOCX 'How to Read This Report' — scoring methodology (compact)."""
+    _heading(doc, "How to Read This Report", size=20, color=INK, accent=BLUE)
+    _para(doc, "Every checked item is graded and rolled up into an objective 0-100 health score, "
+               "computed from the recorded answers - not the AI narrative.", color=INK, size=10, space_after=3)
+    for t in (
+        "Each graded answer scores 1.0 (pass), 0.5 (watch) or 0.0 (fail); a section score is the average x100.",
+        "Compliant-answer logic: some questions are healthy when answered 'No' - the compliant answer counts as a pass.",
+        "Overall grade: 85-100 Good, 50-84 Fair, below 50 Needs Attention.",
+    ):
+        doc.add_paragraph(t, style="List Bullet")
+
+
+def _docx_appendix(doc, areas, grp) -> None:
+    """DOCX submitted-form appendix: every question + response, grouped by area."""
+    started = False
+    for area in areas:
+        doms = [d for (a, d) in grp.keys() if a == area]
+        if area != "Site Profile":
+            doms = [d for d in doms if d != "general"]
+        doms = [d for d in doms if grp.get((area, d))]
+        if not doms:
+            continue
+        if not started:
+            _heading(doc, "Submitted Survey Form", size=22, color=INK, accent=BLUE, space_before=12)
+            _para(doc, "Every recorded question and response, grouped by area - includes custom "
+                       "questions and checklist sub-questions.", color=MUTED, size=9.5, space_after=4)
+            started = True
+        name = "Facility Overview" if area == "Site Profile" else area
+        _heading(doc, name, size=13, color=_area_depth_rgb(str(name).count(">")), space_before=8, space_after=2)
+        for d in doms:
+            rows = grp.get((area, d), [])
+            if not rows:
+                continue
+            _para(doc, _dl(d), bold=True, color=MUTED, size=9, space_before=2, space_after=1)
+            t = doc.add_table(rows=len(rows), cols=2)
+            _no_borders(t)
+            for i, a in enumerate(rows):
+                q = str(a.get("question") or "").strip()
+                v = str(a.get("value") or "").strip() or "-"
+                rem = str(a.get("remark") or "").strip()
+                _cell(t.cell(i, 0), q + (f"\nRemark: {rem}" if rem else ""), color=INK, size=9.5, fill=CREAM)
+                _cell(t.cell(i, 1), v, bold=True, color=WHITE, size=9, align="center", fill=_appendix_resp_rgb(a))
+
+
+def _docx_excluded(doc, excluded) -> None:
+    """DOCX excluded categories, grouped by category (parity with the PDF page)."""
+    by_cat = _excluded_groups(excluded)
+    if not by_cat:
+        return
+    _heading(doc, "Excluded Categories", size=18, color=INK, accent=SLATE, space_before=12)
+    _para(doc, "Marked Not Applicable by the surveyor; excluded from the score and findings.",
+          color=MUTED, size=9.5, space_after=2)
+    for cat, areas in by_cat.items():
+        _para(doc, f"{cat}   ({len(areas)} area{'' if len(areas) == 1 else 's'})",
+              bold=True, color=INK, size=10.5, space_before=4, space_after=1)
+        for a in areas:
+            doc.add_paragraph(a, style="List Bullet")
+
+
+def _docx_glossary(doc) -> None:
+    """DOCX glossary/acronyms + limitations & disclaimer."""
+    _heading(doc, "Glossary & Notes", size=18, color=INK, accent=BLUE, space_before=12)
+    for t, d in (
+        ("Health score", "0-100 objective score computed from the surveyor's graded answers."),
+        ("Finding", "A recorded deficiency (a non-compliant answer) needing corrective action."),
+        ("Compliant answer", "The response to a question that indicates a healthy condition."),
+        ("N/A", "Not applicable - excluded from scoring and findings."),
+        ("ESG", "Environmental, Social & Governance / sustainability assessment."),
+    ):
+        para = doc.add_paragraph()
+        para.paragraph_format.space_after = Pt(1)
+        rb = para.add_run(t + ": ")
+        rb.bold = True
+        rb.font.size = Pt(9.5)
+        rb.font.color.rgb = _rgb(INK)
+        rd = para.add_run(d)
+        rd.font.size = Pt(9.5)
+        rd.font.color.rgb = _rgb(MUTED)
+    _para(doc, "Limitations & disclaimer", bold=True, color=INK, size=10, space_before=4, space_after=1)
+    _para(doc, "This report reflects point-in-time conditions and the surveyor's recorded answers. It is "
+               "decision-support, not an exhaustive engineering or legal audit. Verify critical findings "
+               "independently before acting.", color=MUTED, size=9.5)
 
 
 def _docx_photos(doc, items) -> None:
@@ -1768,7 +2418,7 @@ def _docx_photos(doc, items) -> None:
         try:
             cell.paragraphs[0].add_run().add_picture(io.BytesIO(it["data"]), width=Inches(2.0))
             cap = cell.add_paragraph()
-            rc = cap.add_run(str(it.get("question") or "Photo")[:70])
+            rc = cap.add_run(str(it.get("question") or "Photo"))
             rc.font.size = Pt(7)
             rc.font.color.rgb = _rgb(MUTED)
         except Exception as e:  # noqa: BLE001
@@ -1806,18 +2456,19 @@ def _docx_body(doc, sections, photos, primary, with_photos):
 def render_docx(content: ReportContent, survey: dict,
                 photos: Optional[PhotosMap] = None, view: str = "domain",
                 health: Optional[dict] = None, actions: Optional[list] = None,
-                groups: Optional[list] = None, template: Optional[dict] = None) -> bytes:
+                groups: Optional[list] = None, template: Optional[dict] = None,
+                area_order: Optional[list] = None) -> bytes:
     """Word report mirroring the editorial PDF. Applies the same admin template
     (colours, category labels, section text) under the shared render lock."""
     with _render_lock:
         try:
             apply_template(template)
-            return _render_docx_body(content, survey, photos or {}, view, health, actions, groups or [])
+            return _render_docx_body(content, survey, photos or {}, view, health, actions, groups or [],area_order=area_order)
         finally:
             _reset_template()
 
 
-def _render_docx_body(content, survey, photos, view, health, actions, groups) -> bytes:
+def _render_docx_body(content, survey, photos, view, health, actions, groups, area_order=None) -> bytes:
     doc = Document()
 
     _docx_cover(doc, survey, content)
@@ -1825,7 +2476,7 @@ def _render_docx_body(content, survey, photos, view, health, actions, groups) ->
 
     grp = {(g["area"], g["domain"]): g.get("answers", []) for g in groups}
     secidx = {(s.area, s.domain): s for s in content.sections}
-    areas = _ordered_areas({a for (a, _d) in grp.keys()})
+    areas = _ordered_areas({a for (a, _d) in grp.keys()}, area_order)
 
     # Contents (names only — Word repaginates on open)
     toc_names = ["Executive Summary", "Facility Health Score"]
@@ -1837,6 +2488,10 @@ def _render_docx_body(content, survey, photos, view, health, actions, groups) ->
         toc_names.append(SECTIONS["key_recs"][1])
     _docx_contents(doc, toc_names)
 
+    if areas and _section_on("areas_surveyed"):
+        _docx_area_tree(doc, areas)
+    if _section_on("methodology"):
+        _docx_methodology(doc)
     if _section_on("exec_summary"):
         _docx_exec(doc, content, groups)
     _docx_health(doc, health, content)
@@ -1892,7 +2547,15 @@ def _render_docx_body(content, survey, photos, view, health, actions, groups) ->
 
     if content.key_recommendations and _section_on("key_recs"):
         _divider(doc, *SECTIONS["key_recs"], accent=LIME_G)
-        _docx_key_recs(doc, content)
+        _docx_key_recs(doc, content, actions)
+
+    if _section_on("appendix") and areas:  # full submitted-form appendix (parity with PDF)
+        _divider(doc, *SECTIONS["appendix"], key="appendix")
+        _docx_appendix(doc, areas, grp)
+    if _section_on("excluded"):
+        _docx_excluded(doc, survey.get("_excluded"))
+    if _section_on("glossary"):
+        _docx_glossary(doc)
 
     _para(doc, BACK_COVER_LINE, italic=True, color=MUTED, size=10, space_before=16, space_after=2)
     _para(doc, f"{BRAND}  ·  AI Facility Intelligence", bold=True, color=BLUE, size=10)

@@ -12,7 +12,8 @@ from supabase import Client
 
 from ..auth import get_current_user
 from ..db import get_db
-from ..models import AnswerSync, ReportOut, SurveyCreate, SurveyOut
+from ..models import AdminSurveyCreate, AnswerSync, ReportOut, SurveyCreate, SurveyOut
+from ..services.question_source import load_question_map
 from ..services.report import generate_report
 from ..services.scoring import compute_health, derive_actions
 
@@ -25,6 +26,26 @@ _CODE_ALPHABET = string.ascii_uppercase + string.digits  # no lookalikes strippe
 def _gen_survey_code(n: int = 6) -> str:
     """On-site code shared with the client (kept server-side; never sent to surveyor)."""
     return "".join(secrets.choice(_CODE_ALPHABET) for _ in range(n))
+
+
+def _role_of(db: Client, uid: str, attempts: int = 3) -> str | None:
+    """Look up a user's role from `profiles`.
+
+    Retries transient connection drops (the Supabase pooler occasionally resets an
+    idle keep-alive with 'Server disconnected'). Without this an admin gets
+    fail-closed out of a survey assigned to someone else purely because of a flaky
+    read — which is exactly the 403 seen in the logs. Returns None only after all
+    attempts fail (callers still treat None as 'not admin/manager')."""
+    last: Exception | None = None
+    for i in range(attempts):
+        try:
+            prof = db.table("profiles").select("role").eq("id", uid).limit(1).execute()
+            return (prof.data or [{}])[0].get("role")
+        except Exception as e:  # noqa: BLE001 - retry boundary for transient drops
+            last = e
+            log.warning("[AUTHZ] role lookup attempt %d/%d for user %s failed: %s", i + 1, attempts, uid, e)
+    log.error("[AUTHZ] role lookup exhausted for user %s: %s", uid, last)
+    return None
 
 
 def authorize_survey(
@@ -52,13 +73,7 @@ def authorize_survey(
     assigned = survey.get("assigned_to")
     if not assigned or assigned == uid:
         return survey
-    try:
-        prof = db.table("profiles").select("role").eq("id", uid).limit(1).execute()
-        role = (prof.data or [{}])[0].get("role")
-    except Exception as e:  # noqa: BLE001 - role lookup failure shouldn't 500 the request
-        log.warning("[AUTHZ] role lookup failed for user %s: %s", uid, e)
-        role = None
-    if role in ("admin", "manager"):
+    if _role_of(db, uid) in ("admin", "manager"):
         return survey
     log.warning("[AUTHZ] user %s denied survey %s (assigned=%s)", uid, survey_id, assigned)
     raise HTTPException(status_code=403, detail="not authorized for this survey")
@@ -89,7 +104,54 @@ def create_survey(body: SurveyCreate, db: Client = Depends(get_db)) -> SurveyOut
 
     if not res.data:
         raise HTTPException(status_code=500, detail="insert returned no row")
-    return SurveyOut(**res.data[0])
+
+    # Materialize the survey's own question folder (boilerplate snapshots) +
+    # default building. Lazy import breaks the surveys<->survey_content cycle.
+    created = res.data[0]
+    from .survey_content import materialize_survey_content
+    materialize_survey_content(db, created["id"], body.facility_type, body.domain_slugs)
+    return SurveyOut(**created)
+
+
+@router.post("/admin", response_model=SurveyOut, status_code=201)
+def admin_create_survey(
+    body: AdminSurveyCreate,
+    db: Client = Depends(get_db),
+    user: dict = Depends(get_current_user),
+) -> SurveyOut:
+    """Admin/manager creates a survey directly (no client website booking needed)
+    and optionally assigns it to a surveyor. Same materialization as the public
+    create path. Role-gated: only admin/manager may call it."""
+    if _role_of(db, user.get("id")) not in ("admin", "manager"):
+        raise HTTPException(status_code=403, detail="admin or manager role required")
+
+    row = {
+        "facility_type": body.facility_type,
+        "domain_slugs": body.domain_slugs,
+        "facility_name": body.facility_name,
+        "facility_address": body.facility_address,
+        "total_area": body.total_area,
+        "area_unit": body.area_unit,
+        "blocks": [b.model_dump() for b in body.blocks],
+        "preferred_dates": json.loads(body.model_dump_json())["preferred_dates"],
+        "contact": body.contact.model_dump() if body.contact else {},
+        "form_payload": body.form_payload,
+        "assigned_to": body.assigned_to,
+        "status": "submitted",
+        "survey_code": _gen_survey_code(),
+    }
+    try:
+        res = db.table("surveys").insert(row).execute()
+    except Exception as e:
+        log.error("[DB_ERR] admin_create_survey: %s", e)
+        raise HTTPException(status_code=502, detail="could not create survey") from e
+    if not res.data:
+        raise HTTPException(status_code=500, detail="insert returned no row")
+
+    created = res.data[0]
+    from .survey_content import materialize_survey_content
+    materialize_survey_content(db, created["id"], body.facility_type, body.domain_slugs)
+    return SurveyOut(**created)
 
 
 @router.post("/{survey_id}/verify-code", status_code=200)
@@ -259,9 +321,15 @@ def sync_answers(survey_id: str, body: AnswerSync, db: Client = Depends(get_db),
         }
         for a in body.answers
     ]
+    # Start the survey timer on the first-ever answer. authorize_survey already
+    # loaded the row, so we avoid an extra read; set-once guarded by the column
+    # being null. Best-effort — a timer hiccup must never fail an answer sync.
+    patch: dict = {"status": "in_progress"}
+    if not _sv.get("first_answer_at"):
+        patch["first_answer_at"] = datetime.now(timezone.utc).isoformat()
     try:
         db.table("answers").upsert(rows, on_conflict="survey_id,area,question_id").execute()
-        db.table("surveys").update({"status": "in_progress"}).eq("id", survey_id).execute()
+        db.table("surveys").update(patch).eq("id", survey_id).execute()
     except Exception as e:
         log.error("[DB_ERR] sync_answers survey=%s: %s", survey_id, e)
         raise HTTPException(status_code=502, detail="answer sync failed") from e
@@ -269,17 +337,20 @@ def sync_answers(survey_id: str, body: AnswerSync, db: Client = Depends(get_db),
 
 
 def _load_scoring_inputs(survey_id: str, db: Client) -> tuple[list[dict], dict[str, dict], set[str]]:
-    """Shared loader for /health and /actions: answers, question map, na set."""
+    """Shared loader for /health and /actions: answers, question map, na set.
+
+    Question metadata is resolved via the v1/v2 union source (survey_questions
+    snapshots, falling back to the shared bank), so both eras score. Areas stay as
+    stored ids here — the frontend maps ids -> names for live display; only the
+    server-rendered report translates them.
+    """
     survey = db.table("surveys").select("na_sections").eq("id", survey_id).limit(1).execute()
     if not survey.data:
         raise HTTPException(status_code=404, detail="survey not found")
     na = set(survey.data[0].get("na_sections") or [])
     ans = db.table("answers").select("*").eq("survey_id", survey_id).execute().data or []
     q_ids = list({a["question_id"] for a in ans})
-    questions: dict[str, dict] = {}
-    if q_ids:
-        qrows = db.table("questions").select("*").in_("id", q_ids).execute().data or []
-        questions = {q["id"]: q for q in qrows}
+    questions = load_question_map(db, survey_id, q_ids) if q_ids else {}
     return ans, questions, na
 
 

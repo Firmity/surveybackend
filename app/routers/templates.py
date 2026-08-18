@@ -42,7 +42,7 @@ async def preview(body: dict) -> Response:
     try:
         pdf = await asyncio.to_thread(
             render_pdf, s["content"], s["survey"], s["photos"], s["view"],
-            s["health"], s["actions"], s["groups"], cfg)
+            s["health"], s["actions"], s["groups"], cfg, area_order=s.get("area_order"))
     except Exception as e:  # noqa: BLE001 - external render isolated from the API layer
         log.error("[PREVIEW_ERR] %s", e)
         raise HTTPException(status_code=502, detail="preview render failed") from e

@@ -47,6 +47,36 @@ _SYSTEM = (
 )
 
 
+_REMARK_CAP = 300  # chars; long free-text remarks bloat the prompt without adding signal
+
+
+def _compact_groups(groups: list[dict]) -> list[dict]:
+    """Shrink the LLM payload: keep only question/value/remark, drop empty fields,
+    and cap remark length. A large survey's raw groups can run to hundreds of KB,
+    which pushes Gemini past its own server deadline (504). Compacting keeps every
+    finding but strips the bytes that don't change the narrative.
+    """
+    out: list[dict] = []
+    for g in groups or []:
+        answers = []
+        for a in g.get("answers") or []:
+            item: dict[str, Any] = {}
+            q = a.get("question")
+            if q:
+                item["question"] = q
+            v = a.get("value")
+            if v not in (None, ""):
+                item["value"] = v
+            r = a.get("remark")
+            if r:
+                item["remark"] = r[:_REMARK_CAP]
+            if item:
+                answers.append(item)
+        if answers:
+            out.append({"area": g.get("area"), "domain": g.get("domain"), "answers": answers})
+    return out
+
+
 async def generate_report_content(
     survey: dict[str, Any],
     groups: list[dict],
@@ -75,7 +105,7 @@ async def generate_report_content(
             "unit": survey.get("area_unit"),
         },
         "health_score": health,  # objective score to align the narrative with
-        "groups": groups,
+        "groups": _compact_groups(groups),
     }, ensure_ascii=False)
 
     def _call() -> str:
@@ -83,10 +113,16 @@ async def generate_report_content(
             model=s.gemini_model,
             contents=prompt,
             config=types.GenerateContentConfig(
+                http_options=types.HttpOptions(timeout=int(s.gemini_timeout_s * 1000)),  # ms
                 system_instruction=system,
                 response_mime_type="application/json",
                 response_schema=ReportContent,
                 temperature=0.3,
+                # 2.5-flash "thinks" before answering by default, adding 20-60s of
+                # latency that causes the 504 DEADLINE_EXCEEDED on large surveys.
+                # A structured-JSON audit needs no chain-of-thought → disable it.
+                thinking_config=types.ThinkingConfig(thinking_budget=0),
+                max_output_tokens=8192,
             ),
         )
         return resp.text or ""

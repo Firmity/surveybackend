@@ -54,6 +54,11 @@ class Palette(BaseModel):
     amber: str = "#f59e0b"      # Satisfactory / medium
     red: str = "#dc2626"        # Unsatisfactory / high
     slate: str = "#94a3b8"      # N/A
+    # Area-tree colours (building / floor / room) — colour-code the spatial hierarchy
+    # in the report tree AND the frontend. Kept in the palette so the editor can theme them.
+    area_building: str = "#1e3a5f"
+    area_floor: str = "#0f766e"
+    area_room: str = "#b45309"
 
 
 class Fonts(BaseModel):
@@ -139,15 +144,32 @@ DEFAULT_REPORT_PROMPT = (
     "Do NOT invent equipment, counts, or findings. If a group's data is sparse, say so "
     "rather than guessing. An objective health score (0-100) is provided; make your "
     "`overall_rating` and executive summary CONSISTENT with it (roughly: >=85 Good, "
-    ">=50 Fair, else Needs Attention). Return strictly valid JSON matching the schema."
+    ">=50 Fair, else Needs Attention). "
+    "RECOMMENDATIONS AND CORRECTIVE ACTIONS MUST BE SPECIFIC AND ACTIONABLE: name the "
+    "exact item, the likely root cause, and the concrete step to fix it (what to do, "
+    "with what, and a realistic timeframe). NEVER use vague filler such as 'rectify the "
+    "problem', 'fix the issue', 'take corrective action', 'address the deficiency', or "
+    "'schedule preventive maintenance' with no specifics — a recommendation a technician "
+    "cannot act on directly is unacceptable. Tie every recommendation to a specific "
+    "finding in that group; if a finding has no meaningful remediation, omit it rather "
+    "than pad with generic advice. "
+    "IMPORTANT — each answer carries a `compliant` boolean. compliant=true is a PASS "
+    "(e.g. 'No' to 'Is there scrap on the floor?'); NEVER raise a risk, deficiency, or "
+    "recommendation for a compliant answer, and never describe it negatively. Only "
+    "compliant=false answers are findings. "
+    "Return strictly valid JSON matching the schema."
 )
 
 # Graphs a template can toggle. The first four are today's charts (default ON);
 # the last three are new. Unknown/missing keys fall back to sensible defaults.
 GRAPH_KEYS = ["gauge", "domain_bars", "donut", "heatmap", "priority_matrix", "cost_impact", "trend"]
 GRAPH_DEFAULT_ON = {"gauge", "domain_bars", "donut", "heatmap"}
-# Report body sections a template can show/hide.
-CONTENT_SECTION_KEYS = ["exec_summary", "buildings", "corrective", "key_recs", "photos"]
+# Report body sections a template can show/hide. The first group is the original set;
+# the rest are the new report sections (all default ON via _section_on).
+CONTENT_SECTION_KEYS = [
+    "areas_surveyed", "methodology", "exec_summary", "buildings", "corrective",
+    "key_recs", "excluded", "appendix", "glossary", "photos",
+]
 
 _LENGTH = {
     "concise": "Be brief: 1-2 sentence observations, and surface only the most material risks.",
@@ -317,7 +339,11 @@ def sample_render_inputs() -> dict:
     survey = {"facility_name": "Sample Facility", "facility_type": "commercial",
               "total_area": 50000, "area_unit": "sqft", "facility_address": "Sample Address",
               "contact": {"first_name": "Sample", "last_name": "Manager", "email": "manager@example.com"},
-              "deployment_plan": {}}
+              "deployment_plan": {},
+              # Metadata + excluded so the cover strip, tree and N/A page render in preview.
+              "_report_meta": {"surveyor": "Sample Surveyor", "started_at": "2026-07-16T07:00:00+00:00",
+                               "generated_at": "2026-07-18T16:00:00+00:00", "duration_seconds": 163440},
+              "_excluded": ["Tower A > 2nd Floor > Server Room||fire_safety"]}
     health = {"overall": 78, "grade": "Good",
               "domains": [{"domain": "hvac", "score": 68, "graded": 6},
                           {"domain": "security", "score": 88, "graded": 5},
@@ -330,20 +356,24 @@ def sample_render_inputs() -> dict:
          "question": "Riser condition?", "action": "Seal and re-pressure-test riser"},
         {"severity": "medium", "domain": "security", "area": "Tower B", "finding": "Weak lighting",
          "question": "Perimeter lighting adequate?", "action": "Add two flood fixtures"}]
+    # Breadcrumb-path areas so the colour-coded tree, per-section tree headers and the
+    # submitted-form appendix all render representatively in the live preview.
     groups = [
         {"area": "Site Profile", "domain": "general",
          "answers": [{"question": "Total built-up area", "value": "50000 sqft", "remark": ""},
                      {"question": "Number of floors", "value": "12", "remark": ""}]},
-        {"area": "Tower A", "domain": "hvac",
+        {"area": "Tower A > 1st Floor > AHU Room", "domain": "hvac",
          "answers": [{"question": "AHU filter condition?", "value": "unsatisfactory", "remark": ""},
                      {"question": "Chiller status?", "value": "good", "remark": ""},
                      {"question": "Rated tonnage", "value": "200 TR", "remark": "2 units"}]},
-        {"area": "Tower A", "domain": "plumbing",
+        {"area": "Tower A > 1st Floor > Pump Room", "domain": "plumbing",
          "answers": [{"question": "Riser condition?", "value": "unsatisfactory", "remark": ""},
                      {"question": "Pump room housekeeping?", "value": "satisfactory", "remark": ""}]},
-        {"area": "Tower B", "domain": "security",
+        {"area": "Tower B > Ground Floor > Gatehouse", "domain": "security",
          "answers": [{"question": "Perimeter lighting adequate?", "value": "satisfactory", "remark": ""},
                      {"question": "CCTV coverage?", "value": "good", "remark": ""}]},
     ]
-    return {"content": content, "survey": survey, "photos": {}, "view": "domain",
-            "health": health, "actions": actions, "groups": groups}
+    area_order = ["Tower A > 1st Floor > AHU Room", "Tower A > 1st Floor > Pump Room",
+                  "Tower B > Ground Floor > Gatehouse"]
+    return {"content": content, "survey": survey, "photos": {}, "view": "area",
+            "health": health, "actions": actions, "groups": groups, "area_order": area_order}
